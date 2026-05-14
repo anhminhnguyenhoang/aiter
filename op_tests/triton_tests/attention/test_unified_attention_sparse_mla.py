@@ -275,6 +275,37 @@ def chunk_input(
     )
 
 
+def dense_indices_to_csr(abs_indices, indices_in_kvcache):
+    flat_abs = abs_indices.reshape(-1, abs_indices.shape[-1])
+    flat_physical = indices_in_kvcache.reshape(-1, indices_in_kvcache.shape[-1])
+    num_rows, topk = flat_physical.shape
+
+    csr_abs = torch.full_like(flat_abs, -1)
+    csr_chunks = []
+    indptr = [0]
+    max_sparse_len = 0
+
+    for row in range(num_rows):
+        valid_cols = torch.nonzero(flat_physical[row] != -1, as_tuple=False).flatten()
+        # Exercise ragged rows, including explicit empty rows.
+        target_len = row % (topk + 1)
+        take = min(target_len, valid_cols.numel())
+        if take > 0:
+            cols = valid_cols[:take]
+            csr_abs[row, :take] = flat_abs[row, cols]
+            csr_chunks.append(flat_physical[row, cols])
+        indptr.append(indptr[-1] + take)
+        max_sparse_len = max(max_sparse_len, int(take))
+
+    if csr_chunks:
+        csr_indices = torch.cat(csr_chunks).to(torch.int32)
+    else:
+        csr_indices = torch.empty((0,), dtype=torch.int32, device=flat_physical.device)
+
+    csr_indptr = torch.tensor(indptr, dtype=torch.int32, device=flat_physical.device)
+    return csr_abs.reshape_as(abs_indices), csr_indptr, csr_indices, max_sparse_len
+
+
 @pytest.mark.parametrize("s_q", [1, 64, 177])
 @pytest.mark.parametrize("s_k", [1, 64, 177])
 @pytest.mark.parametrize("top_k", [64, 78])
@@ -351,6 +382,105 @@ def test_triton_unified_attn(
         indices_in_kvcache,
         block_table,
         lora_dim,
+    )
+
+    ref_output = ref_output.to(output.device).to(q.dtype)
+    output = output.reshape(ref_output.shape)
+
+    atol, rtol = 1.5e-2, 1e-2
+    torch.testing.assert_close(
+        output, ref_output, atol=atol, rtol=rtol
+    ), f"{torch.max(torch.abs(output - ref_output))}"
+
+
+@pytest.mark.parametrize("s_q", [1, 17])
+@pytest.mark.parametrize("s_k", [1, 64])
+@pytest.mark.parametrize("num_q_heads", [16, 32])
+@pytest.mark.parametrize("lora_dim", [256, 512])
+@pytest.mark.parametrize("block_size", [16, 64])
+@torch.inference_mode()
+def test_triton_unified_attn_csr(
+    s_q: int,
+    s_k: int,
+    num_q_heads: int,
+    lora_dim: int,
+    block_size: int,
+) -> None:
+    batch = 8
+    top_k = 64
+    rope_dim = 64
+    total_dim = lora_dim + rope_dim
+    softmax_scale = lora_dim**-0.5
+
+    test_p = Param(
+        batch,
+        s_q,
+        s_k,
+        d=total_dim,
+        dv=lora_dim,
+        h_q=num_q_heads,
+        block_size=block_size,
+        is_varlen=True,
+        is_causal=False,
+        is_fp8=False,
+        topk=top_k,
+        test_performance=False,
+    )
+    cache_seqlens, q, block_table, blocked_k, abs_indices, indices_in_kvcache = (
+        generate_test_data(test_p)
+    )
+    abs_indices_csr, kv_indptr, kv_indices, max_sparse_len = dense_indices_to_csr(
+        abs_indices, indices_in_kvcache
+    )
+    ref_output = reference_torch(
+        cache_seqlens,
+        block_table,
+        q,
+        blocked_k,
+        lora_dim,
+        softmax_scale,
+        False,
+        abs_indices_csr,
+    )
+
+    (
+        cu_seqlens_q,
+        max_seqlen_q,
+        seqused_k,
+        max_seqlen_k,
+        q,
+        block_table,
+        blocked_k,
+        abs_indices_csr,
+        _,
+    ) = chunk_input(
+        cache_seqlens,
+        q,
+        block_table,
+        blocked_k,
+        abs_indices_csr,
+        indices_in_kvcache,
+    )
+    kv_indptr = kv_indptr.to("cuda")
+    kv_indices = kv_indices.to("cuda")
+
+    output = torch.empty((*q.shape[:-1], lora_dim), device=q.device, dtype=q.dtype)
+
+    unified_attention_sparse_mla(
+        q,
+        blocked_k,
+        output,
+        cu_seqlens_q,
+        max_seqlen_q,
+        seqused_k,
+        max_seqlen_k,
+        softmax_scale,
+        None,
+        block_table,
+        lora_dim,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        max_sparse_len=max_sparse_len,
     )
 
     ref_output = ref_output.to(output.device).to(q.dtype)

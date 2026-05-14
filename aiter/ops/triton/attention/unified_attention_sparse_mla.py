@@ -1,5 +1,6 @@
 from aiter.ops.triton._triton_kernels.attention.unified_attention_sparse_mla import (
     _kernel_unified_attention_sparse_mla_2d,
+    _kernel_unified_attention_sparse_mla_csr_2d,
 )
 
 
@@ -15,6 +16,9 @@ def unified_attention_sparse_mla(
     topk_indices,
     block_table,
     kv_lora_rank,
+    kv_indptr=None,
+    kv_indices=None,
+    max_sparse_len=None,
 ):
     """
     This function computes the sparse attention.
@@ -28,6 +32,8 @@ def unified_attention_sparse_mla(
     max_seqlen_k:  scalar, dtype int32
     softmax_scale: scalar, dtype float32
     topk_indices:  [seq_len, TOP_K], dtype int32
+    kv_indptr:     Optional [seq_len + 1], dtype int32
+    kv_indices:    Optional [nnz], dtype int32
     block_table:   [BATCH, MAX_NUM_BLOCKS_PER_BATCH], dtype int32
     kv_lora_rank:  scalar, dtype int32
 
@@ -36,6 +42,14 @@ def unified_attention_sparse_mla(
     """
 
     # TODO: This kernel is not optimized and simplified for initial development.
+    use_csr = kv_indptr is not None or kv_indices is not None
+    if use_csr:
+        assert kv_indptr is not None and kv_indices is not None
+        assert kv_indptr.shape[0] == q.shape[0] + 1
+        if max_sparse_len is None:
+            max_sparse_len = int((kv_indptr[1:] - kv_indptr[:-1]).max().item())
+    else:
+        assert topk_indices is not None
 
     block_size = kv.shape[1]
     num_seqs = len(seqused_k)
@@ -43,7 +57,7 @@ def unified_attention_sparse_mla(
     num_kv_heads = 1
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
-    topk_count = topk_indices.shape[1]
+    topk_count = topk_indices.shape[1] if topk_indices is not None else 0
     k = kv
     v = kv[..., :kv_lora_rank]
 
@@ -57,6 +71,44 @@ def unified_attention_sparse_mla(
     TILE_SIZE = block_size
     num_stages_2d = 1
     num_warps = 4
+    if use_csr:
+        _kernel_unified_attention_sparse_mla_csr_2d[(total_num_q_blocks,)](
+            output_ptr=out,
+            query_ptr=q,
+            key_cache_ptr=k,
+            value_cache_ptr=v,
+            kv_indptr_ptr=kv_indptr,
+            kv_indices_ptr=kv_indices,
+            seq_lens_ptr=seqused_k,
+            scale=softmax_scale,
+            num_query_heads=num_query_heads,
+            num_queries_per_kv=num_queries_per_kv,
+            query_stride_0=q.stride(0),
+            query_stride_1=q.stride(1),
+            output_stride_0=out.stride(0),
+            output_stride_1=out.stride(1),
+            BLOCK_SIZE=block_size,
+            stride_k_cache_0=k.stride(0),
+            stride_k_cache_1=k.stride(1),
+            stride_k_cache_2=k.stride(2),
+            stride_k_cache_3=k.stride(3),
+            stride_v_cache_0=v.stride(0),
+            stride_v_cache_1=v.stride(1),
+            stride_v_cache_2=v.stride(2),
+            stride_v_cache_3=v.stride(3),
+            max_sparse_len=max_sparse_len,
+            query_start_len_ptr=cu_seqlens_q,
+            num_seqs=num_seqs,
+            BLOCK_M=BLOCK_M,
+            ROPE_RANK=ROPE_RANK,
+            KV_LORA_RANK=KV_LORA_RANK,
+            TILE_SIZE=TILE_SIZE,
+            ALL_DECODE=ALL_DECODE,
+            num_warps=num_warps,
+            num_stages=num_stages_2d,
+        )
+        return
+
     _kernel_unified_attention_sparse_mla_2d[(total_num_q_blocks,)](
         output_ptr=out,
         query_ptr=q,

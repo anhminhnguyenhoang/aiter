@@ -237,7 +237,205 @@ def _kernel_unified_attention_sparse_mla_2d(
         acc += tl.dot(P.to(V_lora.dtype), V_lora)
 
     # epilogue
-    one_over_L = 1.0 / L[:, None]
+    one_over_L = tl.where(L[:, None] == 0.0, 0.0, 1.0 / L[:, None])
+    acc = acc * one_over_L
+
+    output_offs_lora = (
+        query_offset_0[:, None] * output_stride_0
+        + query_offset_1[:, None] * output_stride_1
+        + offs_lora[None, :]
+    )
+    tl.store(
+        output_ptr + output_offs_lora,
+        acc,
+        mask=query_mask_0[:, None] & query_mask_1[:, None],
+    )
+
+
+@triton.jit
+def _kernel_unified_attention_sparse_mla_csr_2d(
+    output_ptr,  # [num_tokens, num_query_heads, KV_LORA_RANK]
+    query_ptr,  # [num_tokens, num_query_heads, KV_LORA_RANK + ROPE_RANK]
+    key_cache_ptr,  # [num_blks, blk_size, 1, KV_LORA_RANK + ROPE_RANK]
+    value_cache_ptr,  # [num_blks, blk_size, 1, KV_LORA_RANK]
+    kv_indptr_ptr,  # [num_tokens + 1]
+    kv_indices_ptr,  # [nnz]
+    seq_lens_ptr,  # [num_seqs]
+    scale,  # float32
+    num_query_heads: tl.constexpr,  # int
+    num_queries_per_kv: tl.constexpr,  # int
+    query_stride_0: tl.int64,  # int
+    query_stride_1: tl.int64,  # int
+    output_stride_0: tl.int64,  # int
+    output_stride_1: tl.int64,  # int
+    BLOCK_SIZE: tl.constexpr,  # int
+    stride_k_cache_0: tl.int64,  # int
+    stride_k_cache_1: tl.int64,  # int
+    stride_k_cache_2: tl.int64,  # int
+    stride_k_cache_3: tl.constexpr,  # int
+    stride_v_cache_0: tl.int64,  # int
+    stride_v_cache_1: tl.int64,  # int
+    stride_v_cache_2: tl.int64,  # int
+    stride_v_cache_3: tl.constexpr,  # int
+    max_sparse_len: tl.constexpr,
+    query_start_len_ptr,  # [num_seqs+1]
+    num_seqs: tl.int32,
+    BLOCK_M: tl.constexpr,  # int
+    ROPE_RANK: tl.constexpr,
+    KV_LORA_RANK: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    ALL_DECODE: tl.constexpr = False,
+):
+    # only one query per program
+    BLOCK_Q: tl.constexpr = 1
+    kv_head_idx = 0  # assume there is single kv head
+
+    q_block_global_idx = tl.program_id(0)
+    q_ind = q_block_global_idx // (num_query_heads // BLOCK_M)
+    head_ind = q_block_global_idx % (num_query_heads // BLOCK_M)
+    seq_idx = find_seq_idx(query_start_len_ptr, q_ind, num_seqs, BLOCK_Q, False)
+    q_block_start_idx = tl.load(query_start_len_ptr + seq_idx)
+
+    q_block_local_idx = q_ind - q_block_start_idx
+    cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+    cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
+    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+
+    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
+        return
+
+    offs_m = tl.arange(0, BLOCK_M) + head_ind * BLOCK_M
+
+    offs_lora = tl.arange(0, KV_LORA_RANK)
+    offs_rope = tl.arange(KV_LORA_RANK, KV_LORA_RANK + ROPE_RANK)
+
+    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+
+    query_offset_0 = cur_batch_in_all_start_index + query_pos
+    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+
+    query_mask_0 = query_pos < cur_batch_query_len
+    query_mask_1 = query_offset_1 < num_query_heads
+
+    if ALL_DECODE or BLOCK_M >= num_query_heads:
+        Q_cache_modifier: tl.constexpr = ".cg"
+    else:
+        Q_cache_modifier: tl.constexpr = ""
+
+    q_rope_offset = (
+        query_offset_0[:, None] * query_stride_0
+        + query_offset_1[:, None] * query_stride_1
+        + offs_rope[None, :]
+    )
+    Q_rope = tl.load(
+        query_ptr + q_rope_offset,
+        mask=query_mask_0[:, None] & query_mask_1[:, None],
+        other=0.0,
+        cache_modifier=Q_cache_modifier,
+    )
+
+    q_lora_offset = (
+        query_offset_0[:, None] * query_stride_0
+        + query_offset_1[:, None] * query_stride_1
+        + offs_lora[None, :]
+    )
+    Q_lora = tl.load(
+        query_ptr + q_lora_offset,
+        mask=query_mask_0[:, None] & query_mask_1[:, None],
+        other=0.0,
+        cache_modifier=Q_cache_modifier,
+    )
+
+    M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, KV_LORA_RANK], dtype=tl.float32)
+
+    row_start = tl.load(kv_indptr_ptr + q_ind)
+    row_end = tl.load(kv_indptr_ptr + q_ind + 1)
+    row_len = row_end - row_start
+
+    num_tiles = (max_sparse_len + TILE_SIZE - 1) // TILE_SIZE
+    KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
+    for t in range(0, num_tiles):
+        tile_start = t * TILE_SIZE
+        offs_t = tl.arange(0, TILE_SIZE)
+        valid_t = (tile_start + offs_t) < row_len
+
+        kv_pos = tl.load(
+            kv_indices_ptr + row_start + tile_start + offs_t,
+            mask=valid_t,
+            other=-1,
+        )
+        valid_t = valid_t & (kv_pos != -1)
+
+        physical_block_idx = kv_pos // BLOCK_SIZE
+        slot = kv_pos % BLOCK_SIZE
+        S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
+
+        k_rope_ptrs = (
+            key_cache_ptr
+            + physical_block_idx[None, :] * stride_k_cache_0
+            + kv_head_idx * stride_k_cache_2
+            + offs_rope[:, None] * stride_k_cache_3
+            + slot[None, :] * stride_k_cache_1
+        )
+        K_rope = tl.load(
+            k_rope_ptrs,
+            mask=valid_t[None, :],
+            other=0.0,
+            cache_modifier=KV_cache_modifier,
+        )
+        S += scale * tl.dot(Q_rope, K_rope)
+
+        k_lora_ptrs = (
+            key_cache_ptr
+            + physical_block_idx[None, :] * stride_k_cache_0
+            + kv_head_idx * stride_k_cache_2
+            + offs_lora[:, None] * stride_k_cache_3
+            + slot[None, :] * stride_k_cache_1
+        )
+        K_lora = tl.load(
+            k_lora_ptrs,
+            mask=valid_t[None, :],
+            other=0.0,
+            cache_modifier=KV_cache_modifier,
+        )
+
+        S += scale * tl.dot(Q_lora, K_lora)
+
+        S = tl.where(
+            query_mask_1[:, None] & query_mask_0[:, None] & valid_t[None, :],
+            S,
+            float("-inf"),
+        )
+
+        m_j = tl.maximum(M, tl.max(S, axis=1))
+        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+        P = tl.exp(S - m_j[:, None])
+        l_j = tl.sum(P, axis=1)
+        alpha = tl.exp(M - m_j)
+
+        acc = acc * alpha[:, None]
+        L = L * alpha + l_j
+        M = m_j
+
+        v_lora_ptrs = (
+            value_cache_ptr
+            + physical_block_idx[:, None] * stride_v_cache_0
+            + kv_head_idx * stride_v_cache_2
+            + slot[:, None] * stride_v_cache_1
+            + offs_lora[None, :] * stride_v_cache_3
+        )
+        V_lora = tl.load(
+            v_lora_ptrs,
+            mask=valid_t[:, None],
+            other=0.0,
+            cache_modifier=KV_cache_modifier,
+        )
+
+        acc += tl.dot(P.to(V_lora.dtype), V_lora)
+
+    one_over_L = tl.where(L[:, None] == 0.0, 0.0, 1.0 / L[:, None])
     acc = acc * one_over_L
 
     output_offs_lora = (
