@@ -14,6 +14,25 @@ from op_tests.triton_tests.attention.test_unified_attention_sparse_mla import (
 )
 
 
+def reorder_for_sparse_pattern(indices_in_kvcache, pattern):
+    # NSA-style top-k selection (what the test harness emits) clusters
+    # selected indices by physical block — consecutive entries in a row tend
+    # to share a block, so per-tile KV loads stay within few physical blocks.
+    # DSA-style token-level selection picks indices scattered across the
+    # sequence, so per-tile loads scatter across many blocks. Shuffling each
+    # row independently reproduces that scatter without changing validity or
+    # row length (and the -1 padding sentinels stay -1 after shuffle).
+    if pattern == "nsa":
+        return indices_in_kvcache
+    out = indices_in_kvcache.clone()
+    n_rows, n_cols = out.shape
+    perm = torch.argsort(
+        torch.rand(n_rows, n_cols, device=out.device), dim=1
+    )
+    out = torch.gather(out, 1, perm)
+    return out
+
+
 def dense_physical_indices_to_csr(indices_in_kvcache):
     num_rows = indices_in_kvcache.shape[0]
     chunks = []
@@ -75,6 +94,9 @@ def make_inputs(args):
         blocked_k,
         abs_indices,
         indices_in_kvcache,
+    )
+    indices_in_kvcache = reorder_for_sparse_pattern(
+        indices_in_kvcache, args.sparse_pattern
     )
     kv_indptr, kv_indices, max_sparse_len = dense_physical_indices_to_csr(
         indices_in_kvcache
@@ -220,7 +242,8 @@ def run(args):
         "unified_attention_sparse_mla "
         f"batch={args.batch} sq={args.sq} sk={args.sk} heads={args.heads} "
         f"lora={args.lora_dim} rope={args.rope_dim} block={args.block_size} "
-        f"top_k={args.top_k} dtype={args.dtype} nnz={nnz} max_sparse_len={max_sparse_len}"
+        f"top_k={args.top_k} dtype={args.dtype} pattern={args.sparse_pattern} "
+        f"nnz={nnz} max_sparse_len={max_sparse_len}"
     )
     import math as _math
     print(f"topk_matrix_ms={topk_ms:.4f}")
@@ -258,6 +281,18 @@ def main():
         choices=["bf16", "fp8"],
         default="bf16",
         help="KV cache dtype: bf16 (default) or fp8 (e4m3, per-tensor scale)",
+    )
+    parser.add_argument(
+        "--sparse-pattern",
+        choices=["nsa", "dsa"],
+        default="nsa",
+        help=(
+            "Sparse-attention pattern. 'nsa' (default): block-quantized "
+            "selection from the test harness; consecutive indices share a "
+            "physical block. 'dsa': per-row shuffle so consecutive indices "
+            "scatter across blocks, simulating DSA's lightning-indexer "
+            "token-level selection."
+        ),
     )
     run(parser.parse_args())
 

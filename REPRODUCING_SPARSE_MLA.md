@@ -82,6 +82,40 @@ python op_tests/op_benchmarks/triton/bench_unified_attention_sparse_mla.py \
 Add `--validate` to compare against a torch reference, and
 `--skip-mla-decode` if aiter HIP isn't built.
 
+### NSA vs DSA sparsity pattern
+
+`--sparse-pattern {nsa,dsa}` controls how the top-k indices are
+distributed across physical blocks. `nsa` (default) is the
+block-quantized selection emitted by the test harness — consecutive
+indices in a row tend to share a physical block. `dsa` shuffles each
+row's indices so consecutive entries scatter across blocks, simulating
+DeepSeek Sparse Attention's lightning-indexer token-level selection.
+
+```bash
+python op_tests/op_benchmarks/triton/bench_unified_attention_sparse_mla.py \
+    --batch 1 --sq 1 --sk 2048 \
+    --heads 128 --lora-dim 512 --rope-dim 64 --block-size 64 \
+    --top-k 2048 --warmup 25 --rep 100 --validate \
+    --sparse-pattern dsa --dtype bf16
+```
+
+Microbench on the kernel (heads=128, lora=512, rope=64, block=64,
+sk=2048, top_k=2048, BF16, MI355X GPU 4) shows DSA-pattern indices are
+**within noise of NSA-pattern** at every batch — the kernel's index-
+loading path is not coalesced enough for block clustering to matter:
+
+| batch | nsa csr_ms | dsa csr_ms | mla_decode_fwd_ms |
+|---|---|---|---|
+| 1 | 0.0351 | 0.0321 | 0.1056 |
+| 8 | 0.0739 | 0.0738 | 0.0970 |
+| 32 | 0.3126 | 0.3120 | 0.1012 |
+| 64 | 0.6145 | 0.6156 | 0.1058 |
+
+Caveat: at `heads=128` (DeepSeek V3.2-Exp shape) and batch≥32 the
+current `DEFAULT_3D_*` (tuned on `heads=16`) loses badly to
+`mla_decode_fwd` — re-running `UA_SPARSE_MLA_AUTOTUNE=1` on this shape
+is needed before claiming DSA-decode parity.
+
 ## Tunable knobs
 
 All env vars are read in `aiter/ops/triton/attention/unified_attention_sparse_mla.py`.
