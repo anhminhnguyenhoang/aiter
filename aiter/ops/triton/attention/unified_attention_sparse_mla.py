@@ -38,17 +38,28 @@ def _choose_num_segments(num_q_blocks: int, max_sparse_len: int, tile_size: int)
     if num_q_blocks <= 0:
         return 1
     desired = max(1, _NUM_CU_HINT // max(1, num_q_blocks))
-    # round up to next power of two for cleaner Triton constexpr handling
     n = 1
     while n < desired:
         n *= 2
     n = min(n, max_useful)
-    # We require segments to be a power of two for the reduce kernel layout
-    # (offs = tl.arange(0, NUM_SEGMENTS_PER_SEQ)).
     p = 1
     while p < n:
         p *= 2
     return max(1, min(p, 64))
+
+
+def _coerce_scale(s, device):
+    """Coerce Python scalars into 0-d float32 tensors on the right device.
+
+    SGLang sometimes passes Python ``int``/``float`` for scale args; the
+    kernel expects a tensor pointer. ``None`` is preserved (compile-time
+    no-op via the ``Q_SCALE/K_SCALE/V_SCALE`` constexpr flags).
+    """
+    if s is None:
+        return None
+    if isinstance(s, (int, float)):
+        return torch.tensor(s, dtype=torch.float32, device=device)
+    return s
 
 
 def unified_attention_sparse_mla(
@@ -66,19 +77,25 @@ def unified_attention_sparse_mla(
     kv_indptr=None,
     kv_indices=None,
     max_sparse_len=None,
+    q_scale=None,
+    k_scale=None,
+    v_scale=None,
 ):
     """
     Sparse MLA attention.
 
     Q:             [seq_len, NUM_HEADS, kv_lora_rank + rope_rank], bfloat16
-    KV:            [num_blks, blk_size, 1, kv_lora_rank + rope_rank], bfloat16
+    KV:            [num_blks, blk_size, 1, kv_lora_rank + rope_rank], bfloat16 or fp8_e4m3
     cu_seqlens_q:  [BATCH + 1], int32
     softmax_scale: float32
-    topk_indices:  Optional[seq_len, TOP_K] int32
+    topk_indices:  Optional [seq_len, TOP_K] int32
     kv_indptr:     Optional [seq_len + 1] int32
     kv_indices:    Optional [nnz] int32
     block_table:   [BATCH, MAX_NUM_BLOCKS_PER_BATCH] int32
     kv_lora_rank:  int
+    q_scale:       Optional scalar tensor or python float for per-tensor FP8 Q scale
+    k_scale:       Optional scalar tensor or python float for per-tensor FP8 K scale
+    v_scale:       Optional scalar tensor or python float for per-tensor FP8 V scale
 
     Returns:
     out (in-place): [seq_len, NUM_HEADS, kv_lora_rank] bfloat16
@@ -87,11 +104,20 @@ def unified_attention_sparse_mla(
     use_csr = kv_indptr is not None or kv_indices is not None
     if use_csr:
         assert kv_indptr is not None and kv_indices is not None
-        assert kv_indptr.shape[0] == q.shape[0] + 1
+        assert kv_indptr.shape[0] >= q.shape[0] + 1
         if max_sparse_len is None:
-            max_sparse_len = int((kv_indptr[1:] - kv_indptr[:-1]).max().item())
+            row_lens = kv_indptr[1 : q.shape[0] + 1] - kv_indptr[: q.shape[0]]
+            max_sparse_len = int(row_lens.max().item())
     else:
         assert topk_indices is not None
+
+    q_scale_t = _coerce_scale(q_scale, q.device)
+    k_scale_t = _coerce_scale(k_scale, q.device)
+    v_scale_t = _coerce_scale(v_scale, q.device)
+    Q_SCALE = q_scale_t is not None
+    K_SCALE = k_scale_t is not None
+    V_SCALE = v_scale_t is not None
+    HAS_FP8 = Q_SCALE or K_SCALE or V_SCALE
 
     block_size = kv.shape[1]
     num_seqs = len(seqused_k)
@@ -110,7 +136,6 @@ def unified_attention_sparse_mla(
     ROPE_RANK = head_size - kv_lora_rank
     KV_LORA_RANK = kv_lora_rank
 
-    # Default 2D config (used when autotune is off).
     DEFAULT_TILE_SIZE = 64
     DEFAULT_NUM_WARPS = 4
     DEFAULT_NUM_STAGES = 1
@@ -128,10 +153,12 @@ def unified_attention_sparse_mla(
     DEFAULT_3D_WAVES_PER_EU = 2
 
     if use_csr:
-        # Decide whether to take the 3D split-K path.
         effective_len = max_sparse_len
+        # The 3D split-K kernel does not yet plumb FP8 scales; fall back to
+        # the 2D CSR path when any of Q/K/V scale is provided.
         use_split_k = (
             not _DISABLE_SPLIT_K
+            and not HAS_FP8
             and ALL_DECODE
             and total_num_q_blocks > 0
             and total_num_q_blocks < _NUM_CU_HINT
@@ -147,7 +174,6 @@ def unified_attention_sparse_mla(
             num_segments = 1
 
         if use_split_k and num_segments > 1:
-            # 3D split-K path
             segm_output = torch.empty(
                 (q.shape[0], num_query_heads, num_segments, KV_LORA_RANK),
                 dtype=torch.float32,
@@ -214,7 +240,6 @@ def unified_attention_sparse_mla(
                     waves_per_eu=DEFAULT_3D_WAVES_PER_EU,
                 )
 
-            # Reduce
             _kernel_unified_attention_sparse_mla_csr_reduce[
                 (q.shape[0], num_query_heads)
             ](
@@ -245,6 +270,9 @@ def unified_attention_sparse_mla(
             kv_indices_ptr=kv_indices,
             seq_lens_ptr=seqused_k,
             scale=softmax_scale,
+            q_scale=q_scale_t,
+            k_scale=k_scale_t,
+            v_scale=v_scale_t,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
             query_stride_0=q.stride(0),
@@ -267,6 +295,9 @@ def unified_attention_sparse_mla(
             ROPE_RANK=ROPE_RANK,
             KV_LORA_RANK=KV_LORA_RANK,
             ALL_DECODE=ALL_DECODE,
+            Q_SCALE=Q_SCALE,
+            K_SCALE=K_SCALE,
+            V_SCALE=V_SCALE,
         )
         if UA_SPARSE_MLA_AUTOTUNE and _2d_csr_autotuner is not None:
             _2d_csr_autotuner[(total_num_q_blocks,)](**kernel_kwargs)
@@ -291,6 +322,9 @@ def unified_attention_sparse_mla(
         topk_indices_ptr=topk_indices,
         seq_lens_ptr=seqused_k,
         scale=softmax_scale,
+        q_scale=q_scale_t,
+        k_scale=k_scale_t,
+        v_scale=v_scale_t,
         num_query_heads=num_query_heads,
         num_queries_per_kv=num_queries_per_kv,
         block_table_stride=block_table.stride(0),
@@ -314,6 +348,9 @@ def unified_attention_sparse_mla(
         ROPE_RANK=ROPE_RANK,
         KV_LORA_RANK=KV_LORA_RANK,
         ALL_DECODE=ALL_DECODE,
+        Q_SCALE=Q_SCALE,
+        K_SCALE=K_SCALE,
+        V_SCALE=V_SCALE,
     )
     if UA_SPARSE_MLA_AUTOTUNE and _2d_topk_autotuner is not None:
         _2d_topk_autotuner[(total_num_q_blocks,)](**kernel_kwargs)

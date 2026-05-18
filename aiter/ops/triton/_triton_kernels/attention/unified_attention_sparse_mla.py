@@ -125,6 +125,9 @@ def _kernel_unified_attention_sparse_mla_2d(
     topk_indices_ptr,  # [num_tokens, topk]
     seq_lens_ptr,  # [num_seqs]
     scale,  # float32
+    q_scale,  # None or scalar (per-tensor fp8)
+    k_scale,  # None or scalar (per-tensor fp8)
+    v_scale,  # None or scalar (per-tensor fp8)
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
     block_table_stride: tl.int64,  # int
@@ -150,6 +153,9 @@ def _kernel_unified_attention_sparse_mla_2d(
     TILE_SIZE: tl.constexpr,
     ALL_DECODE: tl.constexpr = False,
     PRELOAD_V: tl.constexpr = False,
+    Q_SCALE: tl.constexpr = False,
+    K_SCALE: tl.constexpr = False,
+    V_SCALE: tl.constexpr = False,
 ):
     """
     Sparse MLA 2D kernel using dense top-k indices.
@@ -161,6 +167,10 @@ def _kernel_unified_attention_sparse_mla_2d(
     # exp2 conversion constant — fold into scale once.
     RCP_LN2: tl.constexpr = 1.4426950408889634
     qk_scale = scale * RCP_LN2
+    if Q_SCALE:
+        qk_scale = qk_scale * tl.load(q_scale)
+    if K_SCALE:
+        qk_scale = qk_scale * tl.load(k_scale)
 
     q_block_global_idx = tl.program_id(0)
     q_ind = q_block_global_idx // (num_query_heads // BLOCK_M)
@@ -254,6 +264,7 @@ def _kernel_unified_attention_sparse_mla_2d(
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
+        K_rope = K_rope.to(Q_rope.dtype)
 
         S = tl.dot(Q_rope, K_rope)
 
@@ -271,6 +282,7 @@ def _kernel_unified_attention_sparse_mla_2d(
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
+        K_lora = K_lora.to(Q_lora.dtype)
 
         S = tl.dot(Q_lora, K_lora, acc=S)
         S = S * qk_scale
@@ -289,6 +301,7 @@ def _kernel_unified_attention_sparse_mla_2d(
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
+            V_lora = V_lora.to(Q_lora.dtype)
 
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & valid_t[None, :],
@@ -320,11 +333,14 @@ def _kernel_unified_attention_sparse_mla_2d(
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
+            V_lora = V_lora.to(Q_lora.dtype)
 
         acc += tl.dot(P.to(V_lora.dtype), V_lora)
 
     one_over_L = tl.where(L[:, None] == 0.0, 0.0, 1.0 / L[:, None])
     acc = acc * one_over_L
+    if V_SCALE:
+        acc = acc * tl.load(v_scale)
 
     output_offs_lora = (
         query_offset_0[:, None] * output_stride_0
@@ -351,6 +367,9 @@ def _kernel_unified_attention_sparse_mla_csr_2d(
     kv_indices_ptr,
     seq_lens_ptr,
     scale,
+    q_scale,
+    k_scale,
+    v_scale,
     num_query_heads: tl.constexpr,
     num_queries_per_kv: tl.constexpr,
     query_stride_0: tl.int64,
@@ -375,12 +394,19 @@ def _kernel_unified_attention_sparse_mla_csr_2d(
     TILE_SIZE: tl.constexpr,
     ALL_DECODE: tl.constexpr = False,
     PRELOAD_V: tl.constexpr = False,
+    Q_SCALE: tl.constexpr = False,
+    K_SCALE: tl.constexpr = False,
+    V_SCALE: tl.constexpr = False,
 ):
     BLOCK_Q: tl.constexpr = 1
     kv_head_idx = 0
 
     RCP_LN2: tl.constexpr = 1.4426950408889634
     qk_scale = scale * RCP_LN2
+    if Q_SCALE:
+        qk_scale = qk_scale * tl.load(q_scale)
+    if K_SCALE:
+        qk_scale = qk_scale * tl.load(k_scale)
 
     q_block_global_idx = tl.program_id(0)
     q_ind = q_block_global_idx // (num_query_heads // BLOCK_M)
@@ -441,6 +467,12 @@ def _kernel_unified_attention_sparse_mla_csr_2d(
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, KV_LORA_RANK], dtype=tl.float32)
 
+    qk_scale = scale
+    if Q_SCALE:
+        qk_scale = qk_scale * tl.load(q_scale)
+    if K_SCALE:
+        qk_scale = qk_scale * tl.load(k_scale)
+
     row_start = tl.load(kv_indptr_ptr + q_ind)
     row_end = tl.load(kv_indptr_ptr + q_ind + 1)
     row_len = row_end - row_start
@@ -475,6 +507,7 @@ def _kernel_unified_attention_sparse_mla_csr_2d(
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
+        K_rope = K_rope.to(Q_rope.dtype)
 
         S = tl.dot(Q_rope, K_rope)
 
@@ -491,6 +524,7 @@ def _kernel_unified_attention_sparse_mla_csr_2d(
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
+        K_lora = K_lora.to(Q_lora.dtype)
 
         S = tl.dot(Q_lora, K_lora, acc=S)
         S = S * qk_scale
@@ -509,6 +543,7 @@ def _kernel_unified_attention_sparse_mla_csr_2d(
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
+            V_lora = V_lora.to(Q_lora.dtype)
 
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & valid_t[None, :],
@@ -540,11 +575,14 @@ def _kernel_unified_attention_sparse_mla_csr_2d(
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
+            V_lora = V_lora.to(Q_lora.dtype)
 
         acc += tl.dot(P.to(V_lora.dtype), V_lora)
 
     one_over_L = tl.where(L[:, None] == 0.0, 0.0, 1.0 / L[:, None])
     acc = acc * one_over_L
+    if V_SCALE:
+        acc = acc * tl.load(v_scale)
 
     output_offs_lora = (
         query_offset_0[:, None] * output_stride_0
