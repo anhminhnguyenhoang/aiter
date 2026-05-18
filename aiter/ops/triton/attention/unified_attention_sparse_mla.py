@@ -142,6 +142,16 @@ def unified_attention_sparse_mla(
     DEFAULT_PRELOAD_V = False
     DEFAULT_WAVES_PER_EU = 1
 
+    # Tuned defaults for the 2D CSR path (used when CSR is enabled but the GPU
+    # is already filled — high batch * heads, so 3D split-K's extra parallelism
+    # buys nothing). PRELOAD_V=True + waves_per_eu=2 sweep winners on
+    # heads=128 batch=64 (GLM-5/DSA decode shape): 0.6147 -> 0.4405 ms (28%).
+    DEFAULT_2D_CSR_TILE_SIZE = 64
+    DEFAULT_2D_CSR_NUM_WARPS = 4
+    DEFAULT_2D_CSR_NUM_STAGES = 1
+    DEFAULT_2D_CSR_PRELOAD_V = True
+    DEFAULT_2D_CSR_WAVES_PER_EU = 2
+
     # Tuned defaults for the 3D split-K path. Picked from autotune sweep on
     # GLM-5 decode shapes (heads=16, lora=512, rope=64, block=64, sk=8192,
     # top_k=2048) over batches 1..64. Best config: TILE_SIZE=32, PRELOAD_V=True,
@@ -307,11 +317,11 @@ def unified_attention_sparse_mla(
         else:
             _kernel_unified_attention_sparse_mla_csr_2d[(total_num_q_blocks,)](
                 **kernel_kwargs,
-                TILE_SIZE=DEFAULT_TILE_SIZE,
-                PRELOAD_V=DEFAULT_PRELOAD_V,
-                num_warps=DEFAULT_NUM_WARPS,
-                num_stages=DEFAULT_NUM_STAGES,
-                waves_per_eu=DEFAULT_WAVES_PER_EU,
+                TILE_SIZE=DEFAULT_2D_CSR_TILE_SIZE,
+                PRELOAD_V=DEFAULT_2D_CSR_PRELOAD_V,
+                num_warps=DEFAULT_2D_CSR_NUM_WARPS,
+                num_stages=DEFAULT_2D_CSR_NUM_STAGES,
+                waves_per_eu=DEFAULT_2D_CSR_WAVES_PER_EU,
             )
         return
 

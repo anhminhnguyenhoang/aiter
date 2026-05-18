@@ -106,15 +106,21 @@ loading path is not coalesced enough for block clustering to matter:
 
 | batch | nsa csr_ms | dsa csr_ms | mla_decode_fwd_ms |
 |---|---|---|---|
-| 1 | 0.0351 | 0.0321 | 0.1056 |
-| 8 | 0.0739 | 0.0738 | 0.0970 |
-| 32 | 0.3126 | 0.3120 | 0.1012 |
-| 64 | 0.6145 | 0.6156 | 0.1058 |
+| 1 | 0.0506 | 0.0391 | 0.124 |
+| 8 | 0.0740 | 0.0739 | 0.109 |
+| 32 | 0.3064 | 0.3058 | 0.103 |
+| 64 | 0.4418 | 0.4382 | 0.106 |
 
-Caveat: at `heads=128` (DeepSeek V3.2-Exp shape) and batch≥32 the
-current `DEFAULT_3D_*` (tuned on `heads=16`) loses badly to
-`mla_decode_fwd` — re-running `UA_SPARSE_MLA_AUTOTUNE=1` on this shape
-is needed before claiming DSA-decode parity.
+Status: at `heads=128` (DeepSeek V3.2-Exp shape) batch ≤ 8 the 3D CSR
+path wins (CSR ~2.4× faster than `mla_decode_fwd` at batch=1). Batch ≥
+32 falls into the 2D CSR path (`total_num_q_blocks ≥ _NUM_CU_HINT`) and
+loses to `mla_decode_fwd` by ~3–4× — the kernel's per-CTA work at
+heads=128 high-batch outruns occupancy. The 2D CSR defaults were
+re-tuned for this shape (`DEFAULT_2D_CSR_PRELOAD_V=True`,
+`waves_per_eu=2`); that gave a 28% local speedup on `heads=128 batch=64`
+(0.6147 → 0.4420 ms) but is still ~4× behind ASM. Closing the rest of
+the gap likely needs a kernel restructure (better index-load coalescing
+or BLOCK_M re-tune), not just config tuning.
 
 ## Tunable knobs
 
@@ -132,6 +138,12 @@ config from the sweep on the shape above was
 `TILE_SIZE=32, num_warps=8, num_stages=2, PRELOAD_V=True, waves_per_eu=2`
 for the 3D path. Update `DEFAULT_3D_*` in the wrapper if a new shape needs
 different defaults.
+
+For the 2D CSR path (used when CSR is enabled and `total_num_q_blocks ≥
+_NUM_CU_HINT`), defaults were re-tuned on the heads=128 batch=64 shape:
+`TILE_SIZE=64, num_warps=4, num_stages=1, PRELOAD_V=True, waves_per_eu=2`
+(`DEFAULT_2D_CSR_*` in the wrapper). This is distinct from the dense
+top-k path's defaults — only the CSR launch site uses it.
 
 ## End-to-end (SGLang Run F)
 
