@@ -610,6 +610,9 @@ def _kernel_unified_attention_sparse_mla_csr_3d(
     kv_indptr_ptr,
     kv_indices_ptr,
     scale,
+    q_scale,
+    k_scale,
+    v_scale,
     num_query_heads: tl.constexpr,
     num_queries_per_kv: tl.constexpr,
     query_stride_0: tl.int64,
@@ -637,6 +640,9 @@ def _kernel_unified_attention_sparse_mla_csr_3d(
     segm_stat_stride_head: tl.int64,
     ALL_DECODE: tl.constexpr = False,
     PRELOAD_V: tl.constexpr = False,
+    Q_SCALE: tl.constexpr = False,
+    K_SCALE: tl.constexpr = False,
+    V_SCALE: tl.constexpr = False,
 ):
     """
     Split-K decode kernel: each program processes a segment of KV indices
@@ -649,6 +655,10 @@ def _kernel_unified_attention_sparse_mla_csr_3d(
 
     RCP_LN2: tl.constexpr = 1.4426950408889634
     qk_scale = scale * RCP_LN2
+    if Q_SCALE:
+        qk_scale = qk_scale * tl.load(q_scale)
+    if K_SCALE:
+        qk_scale = qk_scale * tl.load(k_scale)
 
     q_block_global_idx = tl.program_id(0)
     segm_idx = tl.program_id(1)
@@ -769,6 +779,7 @@ def _kernel_unified_attention_sparse_mla_csr_3d(
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
+        K_rope = K_rope.to(Q_rope.dtype)
 
         S = tl.dot(Q_rope, K_rope)
 
@@ -785,6 +796,7 @@ def _kernel_unified_attention_sparse_mla_csr_3d(
             other=0.0,
             cache_modifier=KV_cache_modifier,
         )
+        K_lora = K_lora.to(Q_lora.dtype)
 
         S = tl.dot(Q_lora, K_lora, acc=S)
         S = S * qk_scale
@@ -803,6 +815,7 @@ def _kernel_unified_attention_sparse_mla_csr_3d(
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
+            V_lora = V_lora.to(Q_lora.dtype)
 
         S = tl.where(
             query_mask_1[:, None] & query_mask_0[:, None] & valid_t[None, :],
@@ -834,8 +847,12 @@ def _kernel_unified_attention_sparse_mla_csr_3d(
                 other=0.0,
                 cache_modifier=KV_cache_modifier,
             )
+            V_lora = V_lora.to(Q_lora.dtype)
 
         acc += tl.dot(P.to(V_lora.dtype), V_lora)
+
+    if V_SCALE:
+        acc = acc * tl.load(v_scale)
 
     # Write segment partial (acc is unnormalized, stats are M and L)
     out_offset = (
@@ -939,7 +956,16 @@ def _kernel_unified_attention_sparse_mla_csr_reduce(
 if UA_SPARSE_MLA_AUTOTUNE:
     _2d_topk_autotuner = triton.autotune(
         configs=_get_2d_autotune_configs(),
-        key=["num_query_heads", "KV_LORA_RANK", "BLOCK_SIZE", "BLOCK_M", "topk_count"],
+        key=[
+            "num_query_heads",
+            "KV_LORA_RANK",
+            "BLOCK_SIZE",
+            "BLOCK_M",
+            "topk_count",
+            "Q_SCALE",
+            "K_SCALE",
+            "V_SCALE",
+        ],
     )(_kernel_unified_attention_sparse_mla_2d)
 
     _2d_csr_autotuner = triton.autotune(
@@ -950,6 +976,9 @@ if UA_SPARSE_MLA_AUTOTUNE:
             "BLOCK_SIZE",
             "BLOCK_M",
             "max_sparse_len",
+            "Q_SCALE",
+            "K_SCALE",
+            "V_SCALE",
         ],
     )(_kernel_unified_attention_sparse_mla_csr_2d)
 
@@ -962,6 +991,9 @@ if UA_SPARSE_MLA_AUTOTUNE:
             "BLOCK_M",
             "max_sparse_len",
             "NUM_SEGMENTS_PER_SEQ",
+            "Q_SCALE",
+            "K_SCALE",
+            "V_SCALE",
         ],
     )(_kernel_unified_attention_sparse_mla_csr_3d)
 else:

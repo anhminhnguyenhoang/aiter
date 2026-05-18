@@ -154,11 +154,8 @@ def unified_attention_sparse_mla(
 
     if use_csr:
         effective_len = max_sparse_len
-        # The 3D split-K kernel does not yet plumb FP8 scales; fall back to
-        # the 2D CSR path when any of Q/K/V scale is provided.
         use_split_k = (
             not _DISABLE_SPLIT_K
-            and not HAS_FP8
             and ALL_DECODE
             and total_num_q_blocks > 0
             and total_num_q_blocks < _NUM_CU_HINT
@@ -200,6 +197,9 @@ def unified_attention_sparse_mla(
                 kv_indptr_ptr=kv_indptr,
                 kv_indices_ptr=kv_indices,
                 scale=softmax_scale,
+                q_scale=q_scale_t,
+                k_scale=k_scale_t,
+                v_scale=v_scale_t,
                 num_query_heads=num_query_heads,
                 num_queries_per_kv=num_queries_per_kv,
                 query_stride_0=q.stride(0),
@@ -225,6 +225,9 @@ def unified_attention_sparse_mla(
                 segm_stat_stride_tok=segm_max.stride(0),
                 segm_stat_stride_head=segm_max.stride(1),
                 ALL_DECODE=ALL_DECODE,
+                Q_SCALE=Q_SCALE,
+                K_SCALE=K_SCALE,
+                V_SCALE=V_SCALE,
             )
 
             grid_3d = (total_num_q_blocks, num_segments)

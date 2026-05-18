@@ -33,9 +33,11 @@ f694d452a sparse mla: add CSR (kv_indptr, kv_indices) input path + benchmark + d
 - Per-tile `.to(Q.dtype)` casts promote FP8 K_rope / V_lora to BF16 before
   `tl.dot`.
 - The wrapper coerces python `int`/`float` scales into 0-d tensors and
-  disables the 3D split-K path when any FP8 scale is provided
-  (`use_split_k = ... and not HAS_FP8`). FP8 → 3D plumbing is intentionally
-  deferred — see "Known limitations" below.
+  threads them through both the 2D CSR and 3D split-K paths. FP8 uses the
+  same dispatch policy as BF16 (the 3D kernel was extended to accept
+  `q_scale/k_scale/v_scale` + `Q_SCALE/K_SCALE/V_SCALE` constexpr flags;
+  V_SCALE is applied to each per-segment `acc` before it lands in
+  `segm_output_ptr` so the reduce kernel stays scale-agnostic).
 - `sglang_patches/run_f/` ships an SGLang `forward_aiter` shim + smoke test
   + a `serve_and_bench` script reproducing the end-to-end Run F harness.
 
@@ -66,7 +68,8 @@ python op_tests/op_benchmarks/triton/bench_unified_attention_sparse_mla.py \
 Sweep batch ∈ {1, 8, 32, 64} to see how the 3D split-K advantage tapers as
 batch grows and the 2D grid naturally fills the GPU.
 
-For an FP8 KV-cache run (2D CSR path; 3D split-K is bypassed):
+For an FP8 KV-cache run (now uses the same dispatch as BF16 — 3D split-K
+when CSR is enabled and the GPU is under-filled):
 
 ```bash
 python op_tests/op_benchmarks/triton/bench_unified_attention_sparse_mla.py \
@@ -112,13 +115,14 @@ end-to-end serving number is the final validation gate for this branch.
 
 ## Known limitations
 
-- **FP8 + 3D split-K** is not yet wired. The 3D CSR kernel and reduce kernel
-  don't accept `Q_SCALE/K_SCALE/V_SCALE`, so the wrapper falls back to the
-  2D CSR path whenever any FP8 scale is provided. Plumbing FP8 through the
-  3D path is the obvious next perf lever for FP8 decode at low batch.
 - 3D defaults are tuned for `heads=16, lora=512, rope=64, block=64`. Other
   decode geometries should re-run autotune.
 - `BLOCK_M=16` is hardcoded in the wrapper; changing it requires re-tuning.
+- At higher batches (≥32) FP8 CSR is marginally slower than BF16 CSR
+  (~5%) — the FP8 → BF16 promotion casts cost more than the K-cache
+  bandwidth savings buy back when the kernel is no longer
+  bandwidth-bound. FP8 still wins at batch=1 where the 3D path matters
+  most.
 
 ## File map
 
