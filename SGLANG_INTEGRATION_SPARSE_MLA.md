@@ -164,7 +164,7 @@ branches and the DSA shuffle hook.
 +
 +        if _os_de.environ.get("SGLANG_NSA_USE_UA_SPARSE_MLA") == "1":
 +            # Run F: NSA-routed sparse decode through Triton sparse-MLA kernel.
-+            from aiter.ops.triton.attention.unified_attention_sparse_mla_fp8 import (
++            from aiter.ops.triton.attention.unified_attention_sparse_mla import (
 +                unified_attention_sparse_mla as _ua_sparse_mla,
 +            )
 +            seqused_k = torch.full(
@@ -302,32 +302,6 @@ NSA's block clustering to translate into a measurable kernel win.
 Validate this end-to-end via the F_nsa vs F_dsa pair above; large delta
 would indicate the SGLang dispatch overhead dominates differently
 (unlikely but worth confirming).
-
-### Current `_fp8` import path
-
-`sglang_patches/run_f/new_forward_aiter.py` imports from
-`aiter.ops.triton.attention.unified_attention_sparse_mla_fp8` — a frozen
-older copy of the wrapper that pre-dates the 3D split-K work. It exists
-purely to keep the Run-F SGLang patch from colliding with the autotune-agent
-during the experiment.
-
-**Recommended migration:** swap the import in `new_forward_aiter.py` to the
-main wrapper. Both the main wrapper and the `_fp8` shim now accept identical
-FP8 args (`q_scale, k_scale, v_scale`), so the call site is unchanged. The
-main wrapper additionally gives you the 3D split-K path, which is where
-~2-3× decode speedups at low batch come from.
-
-```python
-# new_forward_aiter.py (recommended)
-from aiter.ops.triton.attention.unified_attention_sparse_mla import (
-    unified_attention_sparse_mla as _ua_sparse_mla,
-)
-```
-
-This migration was not validated end-to-end in this branch (the multi-GPU
-SGLang serve run was deferred to avoid blocking colleagues). The standalone
-smoke test in `smoke_test.py` covers the call surface and uses the `_fp8`
-shim; rerun it against the main wrapper before flipping the production import.
 
 ## Test workflow
 
@@ -479,5 +453,4 @@ The kernel handles head-padding internally only if you do it before calling
 - `sglang_patches/run_f/new_forward_aiter.py` — replacement `_forward_aiter` body with env-gated branches.
 - `sglang_patches/run_f/smoke_test.py` — standalone kernel smoke.
 - `sglang_patches/run_f/serve_and_bench_nsa_F.sh` — full serve+bench orchestration.
-- `aiter/ops/triton/attention/unified_attention_sparse_mla.py` — main wrapper (3D split-K + FP8).
-- `aiter/ops/triton/attention/unified_attention_sparse_mla_fp8.py` — frozen 2D-only variant currently imported by the SGLang patch.
+- `aiter/ops/triton/attention/unified_attention_sparse_mla.py` — main wrapper (3D split-K + FP8); imported by the SGLang patch.

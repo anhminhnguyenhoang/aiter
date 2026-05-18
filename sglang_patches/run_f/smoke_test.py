@@ -8,7 +8,7 @@ import sys
 sys.path.insert(0, "/sgl-workspace/aiter")
 
 import torch
-from aiter.ops.triton.attention.unified_attention_sparse_mla_fp8 import (
+from aiter.ops.triton.attention.unified_attention_sparse_mla import (
     unified_attention_sparse_mla,
 )
 
@@ -77,5 +77,5 @@ unified_attention_sparse_mla(
 torch.cuda.synchronize()
 print("smoke OK; out.abs().max() =", out.abs().max().item())
 print("aiter wrapper path:", end=" ")
-import aiter.ops.triton.attention.unified_attention_sparse_mla_fp8 as m
+import aiter.ops.triton.attention.unified_attention_sparse_mla as m
 print(m.__file__)

@@ -68,9 +68,10 @@
         if _os_de.environ.get("SGLANG_NSA_USE_UA_SPARSE_MLA") == "1":
             # Run F: NSA-routed sparse decode through Triton
             # unified_attention_sparse_mla (CSR variant) with FP8 KV scales.
-            # Use the dedicated _fp8 variant to avoid colliding with the
-            # autotune-agent's wrapper signature (which lacks q_scale/k_scale/v_scale).
-            from aiter.ops.triton.attention.unified_attention_sparse_mla_fp8 import (
+            # Main wrapper unlocks the 3D split-K + reduce path at low batch
+            # (total_num_q_blocks < UNIFIED_ATTENTION_SPARSE_MLA_NUM_CU and
+            # max_sparse_len >= UNIFIED_ATTENTION_SPARSE_MLA_SPLIT_K_THRESHOLD).
+            from aiter.ops.triton.attention.unified_attention_sparse_mla import (
                 unified_attention_sparse_mla as _ua_sparse_mla,
             )
             head_size_v = layer.v_head_dim
