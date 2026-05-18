@@ -81,6 +81,26 @@ durable 28% local speedup (0.6147 → 0.4420 ms). New constants
 top-k launch site so the dense path's defaults stay unchanged for
 back-compat.
 
+**Step 4 — 2D kernel merge (post-followup cleanup).** The 2D dense top-k
+and 2D CSR kernels were ~70% byte-identical; the only divergent region
+was the per-tile KV index fetch. Merged into a single
+`_kernel_unified_attention_sparse_mla_2d` selected by a `USE_CSR:
+tl.constexpr` flag — Triton specializes per constexpr so generated AMDGCN
+is identical to the two prior kernels (no runtime branch cost). Dropped
+the vestigial `block_tables_ptr` / `block_table_stride` params (both 2D
+bodies derived `(page, slot)` from `pos // BLOCK_SIZE` / `pos %
+BLOCK_SIZE` and never dereferenced `block_tables_ptr`). Wrapper keeps two
+autotuner wrappers (`_2d_topk_autotuner`, `_2d_csr_autotuner`) targeting
+the merged kernel with distinct cache keys so per-path tuning state
+stays isolated. Step 7 autotune A/B confirmed CSR's
+`PRELOAD_V=True`/`waves_per_eu=2` winners do NOT transfer to the dense
+path (dense gets 22–27% slower across batch 1–64), so the dense
+defaults stay `PRELOAD_V=False`/`waves_per_eu=1`. Verified: 178/178
+test cases pass; CSR microbench parity within ±3% at every shape (B=1
+heads=16 csr_ms 0.0354 → 0.0313, an incidental win from the merged body
+collapsing a missing-`RCP_LN2` fold in the old CSR kernel — both bodies
+now share the dense path's correct `qk_scale = scale * RCP_LN2`).
+
 **Step 3 — DSA-shaped microbench (`2976c0bca`).** Added a `--sparse-pattern
 {nsa,dsa}` flag to `bench_unified_attention_sparse_mla.py`. `nsa` keeps
 the test harness's block-quantized selection; `dsa` shuffles each row's
@@ -244,8 +264,10 @@ end-to-end serving number is the final validation gate for this branch.
 - `aiter/ops/triton/attention/unified_attention_sparse_mla.py` — Python
   wrapper (dispatch, env knobs, FP8 scale coercion).
 - `aiter/ops/triton/_triton_kernels/attention/unified_attention_sparse_mla.py`
-  — Triton kernels: 2D dense top-k, 2D CSR, 3D CSR split-K, reduce, and
-  the three autotuners.
+  — Triton kernels: unified 2D (`_kernel_unified_attention_sparse_mla_2d`
+  selects dense-topk vs CSR index source via a `USE_CSR: tl.constexpr`
+  flag), 3D CSR split-K, reduce, and the three autotuners (two of which
+  wrap the same merged 2D kernel with different cache keys).
 - `op_tests/op_benchmarks/triton/bench_unified_attention_sparse_mla.py` —
   microbench vs `mla_decode_fwd` with `--dtype {bf16,fp8}` and `--validate`.
 - `sglang_patches/run_f/` — SGLang serve+bench harness for end-to-end Run F.
