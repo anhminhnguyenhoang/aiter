@@ -48,6 +48,23 @@
         _q_scale_f = getattr(layer, "k_scale_float", None)  # scalar form (UA)
         _kv_scale_f = getattr(layer, "k_scale_float", None)
 
+        # DSA-pattern shuffle (benchmarking only). NSA selectors emit
+        # block-clustered kv_indices; SGLANG_NSA_DSA_SHUFFLE=1 randomly
+        # permutes each row so consecutive entries scatter across physical
+        # blocks, simulating DSA (DeepSeek lightning-indexer) token-level
+        # selection. The shuffle preserves the per-row index set so softmax
+        # output is identical up to numerical noise -- only the kernel's
+        # memory access pattern changes. Applies to whichever kernel branch
+        # runs below (D/E/F), so the same flag A/Bs all three under DSA.
+        if _os_de.environ.get("SGLANG_NSA_DSA_SHUFFLE") == "1":
+            for _i in range(bs):
+                _s = int(kv_indptr[_i].item())
+                _e = int(kv_indptr[_i + 1].item())
+                if _e > _s:
+                    kv_indices[_s:_e] = kv_indices[_s:_e][
+                        torch.randperm(_e - _s, device=kv_indices.device)
+                    ]
+
         if _os_de.environ.get("SGLANG_NSA_USE_UA_SPARSE_MLA") == "1":
             # Run F: NSA-routed sparse decode through Triton
             # unified_attention_sparse_mla (CSR variant) with FP8 KV scales.
