@@ -48,14 +48,19 @@
         _q_scale_f = getattr(layer, "k_scale_float", None)  # scalar form (UA)
         _kv_scale_f = getattr(layer, "k_scale_float", None)
 
-        # DSA-pattern shuffle (benchmarking only). NSA selectors emit
-        # block-clustered kv_indices; SGLANG_NSA_DSA_SHUFFLE=1 randomly
-        # permutes each row so consecutive entries scatter across physical
-        # blocks, simulating DSA (DeepSeek lightning-indexer) token-level
-        # selection. The shuffle preserves the per-row index set so softmax
-        # output is identical up to numerical noise -- only the kernel's
-        # memory access pattern changes. Applies to whichever kernel branch
-        # runs below (D/E/F), so the same flag A/Bs all three under DSA.
+        # Scatter-stress shuffle (benchmarking only). SGLang's
+        # nsa_backend is a misnomer -- it actually serves DSA-style models
+        # (GLM-5, DeepSeek-V3.2-Exp); the DSA lightning indexer's emitted
+        # kv_indices may still cluster within physical KV pages depending
+        # on the indexer signal and training distribution. SGLANG_NSA_DSA_SHUFFLE=1
+        # randomly permutes each row so consecutive entries scatter across
+        # physical blocks, forcing the pessimistic gather pattern. The
+        # shuffle preserves the per-row index set so softmax output is
+        # identical up to numerical noise -- only the kernel's memory
+        # access pattern changes. Applies to whichever kernel branch runs
+        # below (D/E/F), so the same flag A/Bs all three under worst-case
+        # scatter. Env var name kept aligned with SGLang's nsa_backend
+        # namespace; "DSA" in the name refers to the shuffle target.
         if _os_de.environ.get("SGLANG_NSA_DSA_SHUFFLE") == "1":
             for _i in range(bs):
                 _s = int(kv_indptr[_i].item())
@@ -66,7 +71,7 @@
                     ]
 
         if _os_de.environ.get("SGLANG_NSA_USE_UA_SPARSE_MLA") == "1":
-            # Run F: NSA-routed sparse decode through Triton
+            # Run F: sparse decode through Triton
             # unified_attention_sparse_mla (CSR variant) with FP8 KV scales.
             # Main wrapper unlocks the 3D split-K + reduce path at low batch
             # (total_num_q_blocks < UNIFIED_ATTENTION_SPARSE_MLA_NUM_CU and
@@ -100,7 +105,7 @@
                 v_scale=_q_scale_t,
             )
         elif _os_de.environ.get("SGLANG_NSA_USE_UNIFIED_ATTN") == "1":
-            # Run E: NSA-routed sparse decode through Triton unified_attention.
+            # Run E: sparse decode through Triton unified_attention.
             from aiter.ops.triton.attention.unified_attention import (
                 unified_attention as _ua_unified_attention,
             )

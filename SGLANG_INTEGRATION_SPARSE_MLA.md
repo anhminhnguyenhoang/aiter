@@ -93,9 +93,12 @@ so `q_scale=None`. The kernel:
 
 ## How the SGLang patch works
 
-SGLang's NSA backend has `class NativeSparseAttnBackend._forward_aiter()` in
-`python/sglang/srt/layers/attention/nsa_backend.py` — that method takes the
-NSA-decimated KV indices and routes them into a decode kernel. The patch
+SGLang's `class NativeSparseAttnBackend._forward_aiter()` in
+`python/sglang/srt/layers/attention/nsa_backend.py` is the entry point.
+The class name is a misnomer — it actually serves DSA models (GLM-5,
+DeepSeek-V3.2-Exp); see "Index distribution" below. That method takes
+the sparse-selector's KV indices and routes them into a decode kernel.
+The patch
 swaps the body for one that branches on env vars:
 
 | Env var | Branch | Kernel |
@@ -152,7 +155,7 @@ branches and the DSA shuffle hook.
 +        _q_scale_f  = getattr(layer, "k_scale_float", None)  # scalar form
 +        _kv_scale_f = getattr(layer, "k_scale_float", None)
 +
-+        # DSA-pattern shuffle (benchmarking only).
++        # Scatter-stress shuffle (benchmarking only).
 +        if _os_de.environ.get("SGLANG_NSA_DSA_SHUFFLE") == "1":
 +            for _i in range(bs):
 +                _s = int(kv_indptr[_i].item())
@@ -163,7 +166,7 @@ branches and the DSA shuffle hook.
 +                    ]
 +
 +        if _os_de.environ.get("SGLANG_NSA_USE_UA_SPARSE_MLA") == "1":
-+            # Run F: NSA-routed sparse decode through Triton sparse-MLA kernel.
++            # Run F: sparse decode through Triton sparse-MLA kernel.
 +            from aiter.ops.triton.attention.unified_attention_sparse_mla import (
 +                unified_attention_sparse_mla as _ua_sparse_mla,
 +            )
@@ -186,7 +189,7 @@ branches and the DSA shuffle hook.
 +                q_scale=_q_scale_t, k_scale=_q_scale_t, v_scale=_q_scale_t,
 +            )
 +        elif _os_de.environ.get("SGLANG_NSA_USE_UNIFIED_ATTN") == "1":
-+            # Run E: NSA-routed sparse decode through Triton unified_attention.
++            # Run E: sparse decode through Triton unified_attention.
 +            from aiter.ops.triton.attention.unified_attention import (
 +                unified_attention as _ua_unified_attention,
 +            )
@@ -251,64 +254,74 @@ branches and the DSA shuffle hook.
 - `nsa_backend.py.preDE` — pristine, before any Run D/E/F work.
 - `nsa_backend.py.preF`  — after D/E but before Run F was added.
 
-## NSA vs DSA modes
+## Index distribution and the scatter-stress A/B
 
-**There is no separate DSA backend in SGLang.** Both NSA models (GLM-5,
-Qwen3-Next) and DSA models (DeepSeek-V3.2-Exp) decode through the same
-`nsa_backend.py._forward_aiter`. The model-specific selector emits a
-CSR `(kv_indptr, kv_indices)` per layer; the kernel never inspects the
-*source* of the indices.
+**Naming caveat first.** SGLang's `nsa_backend.py` is a misnomer. The
+file/class predate the DeepSeek-V3.2 naming and the code path actually
+serves **DSA** (DeepSeek Sparse Attention) models — GLM-5, Qwen3-Next,
+and DeepSeek-V3.2-Exp all use DSA-style indexers, not the original
+block-wise NSA. There is no "NSA model" in the GLM-5/DeepSeek family
+that this backend serves. Env vars and file paths keep the `NSA`/`nsa`
+prefix purely for consistency with the upstream SGLang namespace.
 
-What changes between modes is the **index distribution**:
-- **NSA pattern**: the model's selector picks tokens at block-aligned
-  granularity, so consecutive indices in a row cluster within the same
-  physical KV page. Memory access is coalesced.
-- **DSA pattern**: DeepSeek's lightning indexer picks scattered
-  token-level indices, so consecutive indices in a row scatter across
-  pages. Memory access is gather-dominated.
+For the kernel this distinction is moot: the selector hands it a CSR
+`(kv_indptr, kv_indices)` and the kernel never inspects the *source*.
+What matters at the kernel layer is the **physical distribution** of
+indices within each row:
 
-Two ways to A/B the kernel under these patterns end-to-end:
+- **Real-indexer distribution** (what the model actually emits): DSA
+  picks token-level top-k, but in practice the lightning indexer's
+  signal often correlates with page locality (long contiguous KV
+  regions score similarly), so emitted indices may exhibit partial
+  clustering. The exact distribution depends on the indexer weights,
+  context length, and training corpus.
+- **Uniformly scattered distribution** (worst case): consecutive
+  entries land in different physical KV pages. Memory access is
+  gather-dominated with no spatial reuse.
 
-1. **Real DSA model.** Swap the model arg in `serve_and_bench_nsa_F.sh`
-   to a DSA model (e.g. `deepseek-ai/DeepSeek-V3.2-Exp`). The patch
-   and the kernel are unchanged. Requires the model to be cached and a
-   shape (heads=128, lora=512, rope=64) that the kernel handles — which
-   it does, but at heads=128 batch ≥ 32 the 2D CSR path loses ~3–4× to
-   ASM `mla_decode_fwd` per `REPRODUCING_SPARSE_MLA.md`'s known
-   limitations.
-2. **DSA-shaped indices on an NSA model.** Set
-   `SGLANG_NSA_DSA_SHUFFLE=1`. `new_forward_aiter.py` randomly permutes
-   each row's `kv_indices` immediately after the NSA selector builds
-   them and before any kernel branch (Runs D/E/F) consumes them. The
-   shuffle preserves the per-row index *set*, so softmax output is
-   identical up to numerical noise — only the kernel's gather pattern
-   changes. Costs `bs` host syncs per decode step (a few μs); fine for
-   benchmarking, not for production.
+The `SGLANG_NSA_DSA_SHUFFLE=1` env hook converts the first into the
+second by randomly permuting each row's `kv_indices` immediately after
+the selector builds them and before any kernel branch (Runs D/E/F)
+consumes them. The shuffle preserves the per-row index *set*, so
+softmax output is identical up to numerical noise — only the kernel's
+gather pattern changes. Costs `bs` host syncs per decode step (a few
+μs); fine for benchmarking, never enable in production.
 
-The shuffle is orthogonal to the kernel-selection env vars, so all four
-combinations are reachable from the existing `serve_and_bench_nsa_F.sh`:
+Use it to bound the kernel's performance: if real-indexer and shuffled
+runs land within noise, the kernel's index-load path is not
+coalescing-bound and there is no headroom from making the indexer more
+locality-aware. If shuffled is much slower, the kernel is sensitive to
+page-locality and worth optimizing for gather throughput.
 
 | Combination | Recipe |
 |---|---|
-| **Run F, NSA pattern** | `bash serve_and_bench_nsa_F.sh F_nsa` |
-| **Run F, DSA pattern** | `SGLANG_NSA_DSA_SHUFFLE=1 bash serve_and_bench_nsa_F.sh F_dsa` |
-| **Run D (ASM), NSA pattern** | `SGLANG_NSA_USE_UA_SPARSE_MLA= bash serve_and_bench_nsa_F.sh D_nsa` |
-| **Run D (ASM), DSA pattern** | `SGLANG_NSA_USE_UA_SPARSE_MLA= SGLANG_NSA_DSA_SHUFFLE=1 bash serve_and_bench_nsa_F.sh D_dsa` |
+| **Run F, real-indexer distribution** | `bash serve_and_bench_nsa_F.sh F_real` |
+| **Run F, scatter-stress (shuffled)** | `SGLANG_NSA_DSA_SHUFFLE=1 bash serve_and_bench_nsa_F.sh F_scatter` |
+| **Run D (ASM), real-indexer** | `SGLANG_NSA_USE_UA_SPARSE_MLA= bash serve_and_bench_nsa_F.sh D_real` |
+| **Run D (ASM), scatter-stress** | `SGLANG_NSA_USE_UA_SPARSE_MLA= SGLANG_NSA_DSA_SHUFFLE=1 bash serve_and_bench_nsa_F.sh D_scatter` |
 
-Microbench equivalence (from `REPRODUCING_SPARSE_MLA.md` heads=128
-table): DSA-pattern indices are within noise of NSA-pattern at every
-batch — the kernel's int32 index-load path is not coalesced enough for
-NSA's block clustering to translate into a measurable kernel win.
-Validate this end-to-end via the F_nsa vs F_dsa pair above; large delta
-would indicate the SGLang dispatch overhead dominates differently
-(unlikely but worth confirming).
+Microbench observation (from `REPRODUCING_SPARSE_MLA.md` heads=128
+table): randomly-scattered indices are within noise of block-clustered
+synthetic indices at every batch — the kernel's int32 index-load path
+isn't coalesced enough for clustering to translate into a measurable
+kernel win. The end-to-end serve numbers should match; a large delta
+would suggest SGLang dispatch overhead dominates differently (unlikely
+but worth confirming).
+
+To run against a different DSA model end-to-end (e.g. swap GLM-5 for
+DeepSeek-V3.2-Exp), edit `--model` in `serve_and_bench_nsa_F.sh` — the
+patch and kernel are model-agnostic, but be mindful of shape coverage
+(heads=128, lora=512, rope=64 is the documented sweet spot; at heads=128
+batch ≥ 32 the 2D CSR path loses ~3–4× to ASM `mla_decode_fwd` per
+`REPRODUCING_SPARSE_MLA.md`'s known limitations).
 
 ## Test workflow
 
 ### 1) Standalone kernel smoke
 
-Fastest sanity check — no SGLang involvement. Allocates a synthetic NSA-like
-top-k CSR and runs one decode.
+Fastest sanity check — no SGLang involvement. Allocates a synthetic
+DSA-style scattered top-k CSR (uniformly random per-row indices via
+`torch.randperm`) and runs one decode.
 
 ```bash
 docker exec -it anguyenh-sglang-benchmark bash
@@ -379,20 +392,21 @@ SGLANG_NSA_USE_UA_SPARSE_MLA= bash sglang_patches/run_f/serve_and_bench_nsa_F.sh
 neither `SGLANG_NSA_USE_UA_SPARSE_MLA` nor `SGLANG_NSA_USE_UNIFIED_ATTN`
 is set.)
 
-### 6) Run F under DSA-pattern indices
+### 6) Run F under scatter-stress (uniformly-random index shuffle)
 
-A/B kernel behavior under DSA-scattered indices on the same NSA model
-(no model swap needed — the shuffle hook reorders within each row):
+A/B kernel behavior between the real DSA-indexer output and uniformly
+scattered indices on the same model (no model swap needed — the shuffle
+hook reorders within each row):
 
 ```bash
-# NSA pattern (block-clustered, baseline)
-bash sglang_patches/run_f/serve_and_bench_nsa_F.sh F_nsa_tp4
+# Real DSA-indexer distribution (baseline)
+bash sglang_patches/run_f/serve_and_bench_nsa_F.sh F_real_tp4
 
-# DSA pattern (scattered)
-SGLANG_NSA_DSA_SHUFFLE=1 bash sglang_patches/run_f/serve_and_bench_nsa_F.sh F_dsa_tp4
+# Uniformly scattered (worst-case gather)
+SGLANG_NSA_DSA_SHUFFLE=1 bash sglang_patches/run_f/serve_and_bench_nsa_F.sh F_scatter_tp4
 ```
 
-The two labels (`F_nsa_tp4`, `F_dsa_tp4`) keep the log filenames
+The two labels (`F_real_tp4`, `F_scatter_tp4`) keep the log filenames
 distinct. Per-decode shuffle cost is `bs` host syncs (a few μs) — far
 below decode latency, so the comparison reflects kernel behavior rather
 than the shuffle itself.
@@ -400,19 +414,20 @@ than the shuffle itself.
 Same approach works for Run D and Run E:
 
 ```bash
-# Run D under DSA pattern (kernel: ASM mla_decode_fwd)
+# Run D under scatter-stress (kernel: ASM mla_decode_fwd)
 SGLANG_NSA_USE_UA_SPARSE_MLA= SGLANG_NSA_DSA_SHUFFLE=1 \
-    bash sglang_patches/run_f/serve_and_bench_nsa_F.sh D_dsa_tp4
+    bash sglang_patches/run_f/serve_and_bench_nsa_F.sh D_scatter_tp4
 ```
 
-Expected outcome: F_nsa vs F_dsa within noise (per microbench heads=128
-table in `REPRODUCING_SPARSE_MLA.md`). A large delta would mean the
-SGLang per-step overhead amplifies the kernel difference — worth
+Expected outcome: F_real vs F_scatter within noise (per microbench
+heads=128 table in `REPRODUCING_SPARSE_MLA.md`). A large delta would
+mean the kernel's gather throughput is the bottleneck and there's
+headroom in making the index-load path more coalesced — worth
 investigating if seen.
 
-For a real DSA model (DeepSeek-V3.2-Exp), edit `serve_and_bench_nsa_F.sh`
-to point `--model-path` at the DeepSeek weights and rerun — the patch
-and kernel are unchanged.
+To benchmark a different DSA model (e.g. DeepSeek-V3.2-Exp), edit
+`--model` in `serve_and_bench_nsa_F.sh` and rerun — the patch and
+kernel are model-agnostic.
 
 ## Tunable knobs (env)
 
@@ -423,7 +438,7 @@ Set these in the server's environment (e.g. inside
 |---|---|---|
 | `SGLANG_NSA_USE_UA_SPARSE_MLA` | unset | `=1` routes NSA decode through the Triton sparse MLA kernel |
 | `SGLANG_NSA_USE_UNIFIED_ATTN` | unset | `=1` routes NSA decode through Triton `unified_attention` (Run E). Mutually exclusive with `SGLANG_NSA_USE_UA_SPARSE_MLA` |
-| `SGLANG_NSA_DSA_SHUFFLE` | unset | `=1` randomly permutes each row's `kv_indices` before the kernel call, simulating DSA-pattern scattered selection. Orthogonal to the kernel-selection vars — combine with any of D/E/F |
+| `SGLANG_NSA_DSA_SHUFFLE` | unset | `=1` randomly permutes each row's `kv_indices` before the kernel call, forcing uniformly-scattered access as a worst-case gather A/B against the real DSA-indexer output. Name keeps the `NSA` prefix to match SGLang's namespace; the backend is misnamed (serves DSA models). Orthogonal to the kernel-selection vars — combine with any of D/E/F |
 | `UNIFIED_ATTENTION_SPARSE_MLA_SPLIT_K_THRESHOLD` | 1024 | Minimum `max_sparse_len` to enable 3D split-K. Lower for short-K decode shapes |
 | `UNIFIED_ATTENTION_SPARSE_MLA_DISABLE_SPLIT_K` | 0 | `=1` forces 2D path (A/B for split-K isolation) |
 | `UNIFIED_ATTENTION_SPARSE_MLA_NUM_CU` | 256 | CU-count hint for picking `NUM_SEGMENTS_PER_SEQ`. MI355X has 304; default leaves headroom |
