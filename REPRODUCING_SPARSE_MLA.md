@@ -1,14 +1,21 @@
 # Reproducing the sparse-MLA decode improvements on `ua_sparse_mla`
 
 This document captures the harvested perf work for the Triton
-`unified_attention_sparse_mla` kernel on MI355X. Two commits on top of the
-CSR-input baseline land all of the improvements:
+`unified_attention_sparse_mla` kernel on MI355X. The CSR-input baseline,
+the initial perf wave, and the three-step followup plan together land all
+of the improvements:
 
 ```
+1a28de504 sparse mla: tune 2D CSR defaults for high-batch heads=128       (followup step 2)
+2976c0bca sparse mla: add --sparse-pattern flag for NSA vs DSA microbench (followup step 3)
+49ab2ca7a sparse mla: plumb FP8 scales through 3D split-K path            (followup step 1)
 10d5e8872 sparse mla: add FP8 KV-cache support + Run F SGLang patch
 fe87a54fa sparse mla: 3D split-K + exp2 + tuned defaults for decode shapes
 f694d452a sparse mla: add CSR (kv_indptr, kv_indices) input path + benchmark + docs   <-- baseline
 ```
+
+Followup-plan status: **all three steps merged.** See "Followup plan" below
+for what each step changed and the validation that gated it.
 
 ## What the commits actually change
 
@@ -40,6 +47,57 @@ f694d452a sparse mla: add CSR (kv_indptr, kv_indices) input path + benchmark + d
   `segm_output_ptr` so the reduce kernel stays scale-agnostic).
 - `sglang_patches/run_f/` ships an SGLang `forward_aiter` shim + smoke test
   + a `serve_and_bench` script reproducing the end-to-end Run F harness.
+
+## Followup plan
+
+Three independently-shippable commits resolved the three gaps the initial
+perf wave left open. Each had a microbench gate that had to clear before the
+next step landed.
+
+**Step 1 — FP8 → 3D split-K (`49ab2ca7a`).** The initial 10d5e8872 work
+threaded FP8 scales through the 2D dense and 2D CSR kernels only; the
+wrapper's `use_split_k` was force-gated off when any FP8 scale was set, so
+FP8 decode at low batch fell back to the 2D path and lost the 3D CU-fill
+win. This step mirrored the 2D CSR FP8 pattern into
+`_kernel_unified_attention_sparse_mla_csr_3d` (added `q_scale/k_scale/v_scale`
+ptrs + `Q_SCALE/K_SCALE/V_SCALE` constexprs, folded K_SCALE into
+`qk_scale * RCP_LN2`, applied V_SCALE in the per-segment epilogue so the
+reduce kernel stays scale-agnostic, added the FP8→BF16 promotion casts on
+each tile), dropped the `HAS_FP8` guard in the wrapper, and added the
+FP8 flags to `_3d_csr_autotuner`'s key so BF16 and FP8 configs don't
+collide.
+
+**Step 2 — Autotune sweep + 2D CSR re-tune (`1a28de504`).** A
+`UNIFIED_ATTENTION_SPARSE_MLA_AUTOTUNE=1 TRITON_PRINT_AUTOTUNING=1` sweep
+across `heads ∈ {16, 64, 128}` × `batch ∈ {1, 8, 32, 64}` (GLM-5 lora/rope,
+sk=2048, top_k=2048) found that the 3D defaults already held up across
+shapes — every candidate winner from the autotuner regressed (or was within
+noise of) the baked-in `DEFAULT_3D_*` when re-validated at proper
+`warmup=25/rep=100`. The 2D CSR path was different: at
+heads=128/batch=64 (where `total_num_q_blocks ≥ _NUM_CU_HINT` so the
+dispatcher picks 2D CSR), `PRELOAD_V=True` + `waves_per_eu=2` gave a
+durable 28% local speedup (0.6147 → 0.4420 ms). New constants
+`DEFAULT_2D_CSR_*` (wrapper) split the 2D CSR launch site from the dense
+top-k launch site so the dense path's defaults stay unchanged for
+back-compat.
+
+**Step 3 — DSA-shaped microbench (`2976c0bca`).** Added a `--sparse-pattern
+{nsa,dsa}` flag to `bench_unified_attention_sparse_mla.py`. `nsa` keeps
+the test harness's block-quantized selection; `dsa` shuffles each row's
+indices so consecutive entries scatter across physical blocks, simulating
+DeepSeek V3.2-Exp's lightning-indexer token-level selection. Microbench
+results (heads=128 table below) show DSA-pattern indices are within noise
+of NSA-pattern at every batch — the kernel's index-loading path is not
+coalesced enough for block clustering to matter. At heads=128 batch ≤ 8
+the 3D CSR path still beats `mla_decode_fwd` (~2.4× at batch=1); at
+batch ≥ 32 the 2D CSR path loses ~3–4× to ASM, and Step 2's re-tune is
+the floor for that regime without a kernel restructure.
+
+End-to-end SGLang Run F validation was deferred from this plan
+(multi-GPU multi-hour run; would block colleagues). See
+`SGLANG_INTEGRATION_SPARSE_MLA.md` for the kernel-contract walkthrough,
+the `sglang_patches/run_f/` harness, and the migration recipe for the
+frozen `_fp8` shim still imported by the Run F patch.
 
 ## Container
 
@@ -148,7 +206,11 @@ top-k path's defaults — only the CSR launch site uses it.
 ## End-to-end (SGLang Run F)
 
 `sglang_patches/run_f/` patches SGLang's MLA forward to call
-`unified_attention_sparse_mla` with the CSR input shape.
+`unified_attention_sparse_mla` with the CSR input shape. See
+`SGLANG_INTEGRATION_SPARSE_MLA.md` for the kernel-contract walkthrough,
+the patch flow, the env knobs the patched `_forward_aiter` reads, and the
+migration recipe for the frozen `_fp8` shim that the Run F patch still
+imports.
 
 ```bash
 # inside the container, after the aiter files are copied into /sgl-workspace/aiter
@@ -161,8 +223,15 @@ end-to-end serving number is the final validation gate for this branch.
 
 ## Known limitations
 
-- 3D defaults are tuned for `heads=16, lora=512, rope=64, block=64`. Other
-  decode geometries should re-run autotune.
+- 3D defaults were tuned on `heads=16, lora=512, rope=64, block=64,
+  top_k=2048` and re-validated across `heads ∈ {16, 64, 128}` in Step 2.
+  Other decode geometries (different lora/rope, different top_k) should
+  still re-run autotune — Step 2 only swept the head axis.
+- 2D CSR path at heads=128 batch ≥ 32 is ~3–4× behind `mla_decode_fwd`
+  even after Step 2's `DEFAULT_2D_CSR_*` re-tune. Closing the gap likely
+  requires a kernel restructure (better int32 index-load coalescing or a
+  `BLOCK_M` re-tune), not config tuning. Out of scope for the followup
+  plan.
 - `BLOCK_M=16` is hardcoded in the wrapper; changing it requires re-tuning.
 - At higher batches (≥32) FP8 CSR is marginally slower than BF16 CSR
   (~5%) — the FP8 → BF16 promotion casts cost more than the K-cache
