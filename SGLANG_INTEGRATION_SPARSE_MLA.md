@@ -107,6 +107,150 @@ swaps the body for one that branches on env vars:
 The patcher is a 30-line scan that locates the method by signature and
 swaps the body — no AST/regex magic. See `sglang_patches/run_f/apply_patch.py`.
 
+### What changes in `nsa_backend.py`
+
+`_forward_aiter` lives around line 1870 of
+`python/sglang/srt/layers/attention/nsa_backend.py`. Pristine SGLang has
+it at 58 lines ending in a single `mla_decode_fwd(...)` call with no FP8
+scales. The patch swaps the body for 158 lines with env-gated kernel
+branches and the DSA shuffle hook.
+
+**Invariants the patch preserves:**
+- Method signature: `def _forward_aiter(self, q_all, kv_cache, page_table_1, layer, metadata, bs) -> torch.Tensor` is unchanged.
+- All other methods in the file (including `_forward_aiter_extend` — the
+  prefill path — at line 2012) are untouched.
+- Module-level imports at the top of `nsa_backend.py` are unchanged. All
+  new imports (`aiter.ops.triton...`, `os`, kernel wrappers) happen
+  *inside* the swapped body. This is what keeps the patch a pure
+  body-swap, no AST manipulation.
+- The first 39 body lines (Q/O setup through `get_valid_kv_indices`) and
+  the trailing 2 lines (`need_pad_heads` reshape + `return o`) are
+  byte-identical to pristine.
+
+**The diff** (only the middle 17 lines balloon to 117):
+
+```diff
+         kv_indices = self.kv_indices
+         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
+
+-        mla_decode_fwd(
+-            q_kernel,
+-            kv_cache.view(-1, 1, 1, layer.head_dim),
+-            o_kernel,
+-            metadata.cu_seqlens_q,
+-            kv_indptr,
+-            kv_indices,
+-            metadata.cu_seqlens_q,
+-            metadata.max_seq_len_q,
+-            sm_scale=layer.scaling,
+-            logit_cap=layer.logit_cap,
+-        )
++        # ===== Runs D/E/F patch (additive): forward FP8 scales + env-gated UA branches =====
++        import os as _os_de
++        _q_scale_t  = getattr(layer, "k_scale", None)        # tensor form (ASM/UA)
++        _kv_scale_t = getattr(layer, "k_scale", None)
++        _q_scale_f  = getattr(layer, "k_scale_float", None)  # scalar form
++        _kv_scale_f = getattr(layer, "k_scale_float", None)
++
++        # DSA-pattern shuffle (benchmarking only).
++        if _os_de.environ.get("SGLANG_NSA_DSA_SHUFFLE") == "1":
++            for _i in range(bs):
++                _s = int(kv_indptr[_i].item())
++                _e = int(kv_indptr[_i + 1].item())
++                if _e > _s:
++                    kv_indices[_s:_e] = kv_indices[_s:_e][
++                        torch.randperm(_e - _s, device=kv_indices.device)
++                    ]
++
++        if _os_de.environ.get("SGLANG_NSA_USE_UA_SPARSE_MLA") == "1":
++            # Run F: NSA-routed sparse decode through Triton sparse-MLA kernel.
++            from aiter.ops.triton.attention.unified_attention_sparse_mla_fp8 import (
++                unified_attention_sparse_mla as _ua_sparse_mla,
++            )
++            seqused_k = torch.full(
++                (bs,), self.nsa_index_topk,
++                dtype=torch.int32, device=q_kernel.device,
++            )
++            _kvview = kv_cache.view(-1, 1, 1, layer.head_dim)
++            _ua_sparse_mla(
++                q=q_kernel, kv=_kvview, out=o_kernel,
++                cu_seqlens_q=metadata.cu_seqlens_q,
++                max_seqlen_q=metadata.max_seq_len_q,
++                seqused_k=seqused_k,
++                max_seqlen_k=self.nsa_index_topk,
++                softmax_scale=layer.scaling,
++                topk_indices=None, block_table=None,
++                kv_lora_rank=layer.v_head_dim,
++                kv_indptr=kv_indptr, kv_indices=kv_indices,
++                max_sparse_len=int(self.nsa_index_topk),  # avoid host sync per decode
++                q_scale=_q_scale_t, k_scale=_q_scale_t, v_scale=_q_scale_t,
++            )
++        elif _os_de.environ.get("SGLANG_NSA_USE_UNIFIED_ATTN") == "1":
++            # Run E: NSA-routed sparse decode through Triton unified_attention.
++            from aiter.ops.triton.attention.unified_attention import (
++                unified_attention as _ua_unified_attention,
++            )
++            seqused_k = torch.full(
++                (bs,), self.nsa_index_topk,
++                dtype=torch.int32, device=q_kernel.device,
++            )
++            dummy_bt = torch.zeros((bs, 1), dtype=torch.int32, device=q_kernel.device)
++            _kvview = kv_cache.view(-1, 1, 1, layer.head_dim)
++            _ua_unified_attention(
++                q=q_kernel, k=_kvview, v=_kvview[..., :layer.v_head_dim],
++                out=o_kernel,
++                cu_seqlens_q=metadata.cu_seqlens_q,
++                max_seqlen_q=metadata.max_seq_len_q,
++                seqused_k=seqused_k,
++                max_seqlen_k=self.nsa_index_topk,
++                softmax_scale=layer.scaling,
++                causal=False, window_size=(-1, -1), softcap=0.0,
++                q_descale=None, k_descale=_q_scale_t, v_descale=_q_scale_t,
++                block_table=dummy_bt, sinks=None,
++                kv_indptr=kv_indptr, kv_indices=kv_indices,
++            )
++        else:
++            # Run D (default): ASM mla_decode_fwd, now with FP8 scales forwarded.
++            mla_decode_fwd(
++                q_kernel,
++                kv_cache.view(-1, 1, 1, layer.head_dim),
++                o_kernel,
++                metadata.cu_seqlens_q,
++                kv_indptr, kv_indices,
++                metadata.cu_seqlens_q,
++                metadata.max_seq_len_q,
++                sm_scale=layer.scaling, logit_cap=layer.logit_cap,
++                q_scale=_q_scale_t, kv_scale=_kv_scale_t,
++            )
+
+         if self.need_pad_heads:
+             o = o_kernel[:, :: self.head_repeat_factor, :]
+
+         return o
+```
+
+**Five logical pieces:**
+
+1. **FP8 scale lookup** (4 lines). Bug fix: pristine code never forwarded
+   `layer.k_scale` to the decode kernel, so `--kv-cache-dtype fp8_e4m3`
+   runs asserted inside `mla_decode_stage1_asm_fwd`. We grab both the
+   tensor and float forms once and pass whichever each kernel expects.
+2. **DSA shuffle** (env-gated, ~7 lines). Runs *before* the kernel
+   fan-out so it affects whichever branch is selected. `bs` host syncs
+   per decode — benchmarking only; never enable in production.
+3. **Run F branch** (`SGLANG_NSA_USE_UA_SPARSE_MLA=1`). Calls
+   `unified_attention_sparse_mla` with the CSR inputs. `topk_indices=None`
+   and `block_table=None` force the CSR dispatch path inside the wrapper.
+4. **Run E branch** (`SGLANG_NSA_USE_UNIFIED_ATTN=1`). Calls the dense
+   Triton `unified_attention`; needs `dummy_bt` because there's a
+   kernel-side assertion that's unread on the sparse-KV branch.
+5. **Run D default** (no env var set). Original `mla_decode_fwd` call
+   with `q_scale`/`kv_scale` added.
+
+**Backup files** the container preserves for `diff` sanity checks:
+- `nsa_backend.py.preDE` — pristine, before any Run D/E/F work.
+- `nsa_backend.py.preF`  — after D/E but before Run F was added.
+
 ## NSA vs DSA modes
 
 **There is no separate DSA backend in SGLang.** Both NSA models (GLM-5,
