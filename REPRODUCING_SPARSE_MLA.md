@@ -30,8 +30,13 @@ for what each step changed and the validation that gated it.
 - Softmax uses `tl.math.exp2` with `RCP_LN2` folded into `qk_scale`.
 - `tl.dot(Q_lora, K_lora, acc=S)` fuses the lora dot onto the rope dot.
 - `PRELOAD_V=True` overlaps the V load with softmax.
-- Tuned 3D defaults: `TILE_SIZE=32, num_warps=8, num_stages=2,
-  PRELOAD_V=True, waves_per_eu=2` (autotune sweep on GLM-5 decode shapes).
+- Tuned 3D defaults are now dispatched by `num_query_heads`:
+  - heads ≤ 8 → `TILE_SIZE=64, num_warps=8, num_stages=1,
+    PRELOAD_V=False, waves_per_eu=2` (GLM-5 heads=8 b=1 autotune winner,
+    re-tuned 2026-05-19).
+  - heads ≥ 16 → `TILE_SIZE=32, num_warps=8, num_stages=2,
+    PRELOAD_V=True, waves_per_eu=2` (the prior heads=16 b=1 winner from
+    the sk=8192 sweep, kept so heads=16 callers don't regress).
 
 **`10d5e8872` (FP8 KV-cache + SGLang serve harness)**
 - 2D dense top-k and 2D CSR kernels grow per-tensor `q_scale/k_scale/v_scale`
@@ -122,39 +127,58 @@ frozen `_fp8` shim still imported by the Run F patch.
 ## Container
 
 Builds, tests, and benches must run inside the project's docker container —
-the bare host has no torch/triton/aiter. The container used for all numbers
-in this doc is `anguyenh-sglang-benchmark`. Copy the worktree's
-`aiter/ops/triton/...` files into `/sgl-workspace/aiter/...` inside the
-container before benching.
+the bare host has no torch/triton/aiter.
+
+- **GLM-5 microbench (heads=8, BF16 + FP8 KV-cache, MI355X / gfx950):**
+  use `anguyenh-dev-2` (image `amdsiloai/pytorch-xdit:v26.4`). The
+  worktree is bind-mounted at the same host path, so no file copy is
+  needed — just `docker exec -w /home/anguyenh/aiter_ua/.claude/worktrees/<wt>
+  anguyenh-dev-2 ...`.
+- **SGLang end-to-end Run F:** use `anguyenh-sglang-benchmark` and copy
+  the worktree's `aiter/ops/triton/...` files into
+  `/sgl-workspace/aiter/...` inside the container before benching.
 
 ## Microbench (CSR vs `mla_decode_fwd`)
 
-GLM-5 decode shape sweep (heads=16, lora=512, rope=64, block=64, sk=2048,
+GLM-5 decode shape sweep (heads=8, lora=512, rope=64, block=64, sk=2048,
 top_k=2048). The CSR path on `ua_sparse_mla` beats the ASM
-`mla_decode_fwd` baseline by 1.4–2.94× across batch 1–64. The 3D split-K
-restructure is the dominant lever — at batch=1 it accounts for an ~8×
-local speedup over the 2D-only version.
+`mla_decode_fwd` baseline by **1.77–1.88× at batch ≤ 8**, ties at
+batch=32, and loses ~0.92× at batch=64. The 3D split-K restructure is the
+dominant lever — at heads=8 batch=1 only `cdiv(8, BLOCK_M=16) = 1`
+q-block launches per token, so without split-K a single decode pins 1
+CTA on a 304-CU GPU.
+
+**Heads<BLOCK_M precondition.** The wrapper's `total_num_q_blocks` math
+uses `triton.cdiv(num_query_heads, BLOCK_M)`, and the kernels mask lanes
+`>= num_query_heads` so heads=8 (or any heads<16) runs correctly. The
+pre-fix integer-floor form (`heads // BLOCK_M`) launched a 0-program
+grid at heads=8 and divided by zero inside the kernel — heads=8 simply
+didn't run on the older branch.
 
 ```bash
-# inside the container
-python op_tests/op_benchmarks/triton/bench_unified_attention_sparse_mla.py \
-    --batch 1 --sq 1 --sk 2048 \
-    --heads 16 --lora-dim 512 --rope-dim 64 --block-size 64 \
-    --top-k 2048 --warmup 25 --rep 100
+# inside anguyenh-dev-2 (GLM-5 microbench)
+docker exec -w /home/anguyenh/aiter_ua/.claude/worktrees/<wt> anguyenh-dev-2 \
+    python op_tests/op_benchmarks/triton/bench_unified_attention_sparse_mla.py \
+        --batch 1 --sq 1 --sk 2048 \
+        --heads 8 --lora-dim 512 --rope-dim 64 --block-size 64 \
+        --top-k 2048 --warmup 25 --rep 100
 ```
 
 Sweep batch ∈ {1, 8, 32, 64} to see how the 3D split-K advantage tapers as
-batch grows and the 2D grid naturally fills the GPU.
+batch grows and the 2D grid naturally fills the GPU. ASM `mla_decode_fwd`
+heads=8 is reached via the post-merge `gfx950 + bf16` catch-all in
+`aiter/mla.py`, which dispatches `mla_a16w16_qh8_qseqlen1_gqaratio8_v3.co`.
 
 For an FP8 KV-cache run (now uses the same dispatch as BF16 — 3D split-K
 when CSR is enabled and the GPU is under-filled):
 
 ```bash
-python op_tests/op_benchmarks/triton/bench_unified_attention_sparse_mla.py \
-    --batch 1 --sq 1 --sk 2048 \
-    --heads 16 --lora-dim 512 --rope-dim 64 --block-size 64 \
-    --top-k 2048 --warmup 25 --rep 100 \
-    --dtype fp8
+docker exec -w /home/anguyenh/aiter_ua/.claude/worktrees/<wt> anguyenh-dev-2 \
+    python op_tests/op_benchmarks/triton/bench_unified_attention_sparse_mla.py \
+        --batch 1 --sq 1 --sk 2048 \
+        --heads 8 --lora-dim 512 --rope-dim 64 --block-size 64 \
+        --top-k 2048 --warmup 25 --rep 100 \
+        --dtype fp8
 ```
 
 Add `--validate` to compare against a torch reference, and
@@ -211,15 +235,47 @@ All env vars are read in `aiter/ops/triton/attention/unified_attention_sparse_ml
 | `UNIFIED_ATTENTION_SPARSE_MLA_NUM_CU` | `256` | CU-count hint used to pick `NUM_SEGMENTS_PER_SEQ`. MI355X has 304 CUs; this hint is intentionally a bit smaller to leave headroom for waves. |
 | `UNIFIED_ATTENTION_SPARSE_MLA_AUTOTUNE` | (off) | When set, runs the Triton autotuners (`_2d_csr_autotuner`, `_2d_topk_autotuner`, `_3d_csr_autotuner`) instead of the baked-in defaults. Use to re-sweep configs on a new shape. |
 
-If you re-tune via `UNIFIED_ATTENTION_SPARSE_MLA_AUTOTUNE=1`, the winning
-config from the sweep on the shape above was
-`TILE_SIZE=32, num_warps=8, num_stages=2, PRELOAD_V=True, waves_per_eu=2`
-for the 3D path. Update `DEFAULT_3D_*` in the wrapper if a new shape needs
-different defaults.
+If you re-tune via `UNIFIED_ATTENTION_SPARSE_MLA_AUTOTUNE=1`, the current
+baked 3D winners are dispatched by `num_query_heads`:
+- heads ≤ 8 (GLM-5): `TILE_SIZE=64, num_warps=8, num_stages=1,
+  PRELOAD_V=False, waves_per_eu=2`.
+- heads ≥ 16 (prior tuning target): `TILE_SIZE=32, num_warps=8,
+  num_stages=2, PRELOAD_V=True, waves_per_eu=2`.
+
+Update `DEFAULT_3D_*_HEADS8` / `DEFAULT_3D_*_HEADS16` in the wrapper
+(or add a new branch) if a new shape needs different defaults.
+
+The baked defaults are dtype-agnostic. A separate FP8 autotune sweep at
+heads=8 was run (2026-05-20) — the per-batch FP8 winners differed on
+`num_warps` / `PRELOAD_V` / `waves_per_eu`, but at proper warmup=25/rep=100
+each FP8-autotuned config regressed against the BF16-baked default at
+b ∈ {1, 8, 32}; only b=64 was ~20% faster autotuned. Triton's internal
+autotune timing is noisier than the bench, so the BF16-baked values are
+kept as the single fallback. FP8 callers in the heads=8 b=64 regime can
+opt into `UNIFIED_ATTENTION_SPARSE_MLA_AUTOTUNE=1` for that modest win.
+
+### FP8 vs ASM `mla_a8w8_qh8_qseqlen1_gqaratio8_v3` (heads=8 cross-check, apples-to-apples)
+
+The bench script's `--dtype fp8` flag skips the ASM baseline by default
+(that gate was written before the post-merge `mla.py` exposed FP8 at
+heads=8 max_seqlen_q=1 on gfx950). ASM is a8w8 — Q must also be FP8.
+Triton matches via the existing `q_scale` arg (2026-05-20):
+
+| batch | tri_a8w8 (fp8-Q + fp8-KV) | asm_a8w8 | tri / asm |
+|---|---|---|---|
+| 1  | 0.0314 ms | 0.0505 ms | 0.62x (Triton **1.61x**) |
+| 8  | 0.0315 ms | 0.0518 ms | 0.61x (Triton **1.64x**) |
+| 32 | 0.0313 ms | 0.0451 ms | 0.70x (Triton **1.44x**) |
+| 64 | 0.0501 ms | 0.0444 ms | 1.13x (**ASM wins**) |
+
+Triton wins 1.44–1.64x at b ≤ 32; ASM only takes the lead at b=64, by
+1.13x. The earlier "ASM wins 1.64x at b=64" framing came from an unfair
+comparison (bf16-Q Triton vs fp8-Q ASM). Correctness: fp8-Q + fp8-KV
+rel error vs bf16 reference is 3.85%, no NaN/Inf.
 
 For the 2D CSR path (used when CSR is enabled and `total_num_q_blocks ≥
-_NUM_CU_HINT`), defaults were re-tuned on the heads=128 batch=64 shape:
-`TILE_SIZE=64, num_warps=4, num_stages=1, PRELOAD_V=True, waves_per_eu=2`
+_NUM_CU_HINT`), defaults are tuned on the heads=128 batch=64 shape:
+`TILE_SIZE=64, num_warps=4, num_stages=1, PRELOAD_V=False, waves_per_eu=2`
 (`DEFAULT_2D_CSR_*` in the wrapper). This is distinct from the dense
 top-k path's defaults — only the CSR launch site uses it.
 
@@ -243,16 +299,21 @@ end-to-end serving number is the final validation gate for this branch.
 
 ## Known limitations
 
-- 3D defaults were tuned on `heads=16, lora=512, rope=64, block=64,
-  top_k=2048` and re-validated across `heads ∈ {16, 64, 128}` in Step 2.
-  Other decode geometries (different lora/rope, different top_k) should
-  still re-run autotune — Step 2 only swept the head axis.
+- 3D defaults are dispatched by `num_query_heads`: heads ≤ 8 uses the
+  GLM-5 b=1 winner (2026-05-19 sweep), heads ≥ 16 uses the prior
+  sk=8192 heads=16 b=1 winner. Other decode geometries (different
+  lora/rope, different top_k, or intermediate head counts) should still
+  re-run autotune.
 - 2D CSR path at heads=128 batch ≥ 32 is ~3–4× behind `mla_decode_fwd`
   even after Step 2's `DEFAULT_2D_CSR_*` re-tune. Closing the gap likely
   requires a kernel restructure (better int32 index-load coalescing or a
   `BLOCK_M` re-tune), not config tuning. Out of scope for the followup
   plan.
-- `BLOCK_M=16` is hardcoded in the wrapper; changing it requires re-tuning.
+- `BLOCK_M=16` is hardcoded in the wrapper. At heads<BLOCK_M (e.g.
+  GLM-5 heads=8) the kernel wastes 50% of MFMA lanes per tile; the
+  per-tile head mask zeroes the unused lanes but the work is still
+  paid for. Switching to BLOCK_M=8 would require a deeper MFMA tile
+  re-mapping. Changing BLOCK_M also requires re-tuning.
 - At higher batches (≥32) FP8 CSR is marginally slower than BF16 CSR
   (~5%) — the FP8 → BF16 promotion casts cost more than the K-cache
   bandwidth savings buy back when the kernel is no longer

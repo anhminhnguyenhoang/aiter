@@ -173,9 +173,11 @@ def _kernel_unified_attention_sparse_mla_2d(
     if K_SCALE:
         qk_scale = qk_scale * tl.load(k_scale)
 
+    # ceil-div so heads < BLOCK_M (e.g. GLM-5 heads=8) still get one head block.
+    NUM_HEAD_BLOCKS: tl.constexpr = (num_query_heads + BLOCK_M - 1) // BLOCK_M
     q_block_global_idx = tl.program_id(0)
-    q_ind = q_block_global_idx // (num_query_heads // BLOCK_M)
-    head_ind = q_block_global_idx % (num_query_heads // BLOCK_M)
+    q_ind = q_block_global_idx // NUM_HEAD_BLOCKS
+    head_ind = q_block_global_idx % NUM_HEAD_BLOCKS
     seq_idx = find_seq_idx(query_start_len_ptr, q_ind, num_seqs, BLOCK_Q, False)
     q_block_start_idx = tl.load(query_start_len_ptr + seq_idx)
 
@@ -199,7 +201,10 @@ def _kernel_unified_attention_sparse_mla_2d(
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
 
     query_mask_0 = query_pos < cur_batch_query_len
-    query_mask_1 = query_offset_1 < num_query_heads
+    # Lane mask: at heads < BLOCK_M (e.g. GLM-5 heads=8), lanes >= num_query_heads
+    # would otherwise alias into the next query token via offs_m // num_queries_per_kv.
+    # Combine with the per-head bound so those lanes never load/store.
+    query_mask_1 = (query_offset_1 < num_query_heads) & (offs_m < num_query_heads)
 
     if ALL_DECODE or BLOCK_M >= num_query_heads:
         Q_cache_modifier: tl.constexpr = ".cg"
@@ -434,11 +439,13 @@ def _kernel_unified_attention_sparse_mla_csr_3d(
     if K_SCALE:
         qk_scale = qk_scale * tl.load(k_scale)
 
+    # ceil-div so heads < BLOCK_M (e.g. GLM-5 heads=8) still get one head block.
+    NUM_HEAD_BLOCKS: tl.constexpr = (num_query_heads + BLOCK_M - 1) // BLOCK_M
     q_block_global_idx = tl.program_id(0)
     segm_idx = tl.program_id(1)
 
-    q_ind = q_block_global_idx // (num_query_heads // BLOCK_M)
-    head_ind = q_block_global_idx % (num_query_heads // BLOCK_M)
+    q_ind = q_block_global_idx // NUM_HEAD_BLOCKS
+    head_ind = q_block_global_idx % NUM_HEAD_BLOCKS
     seq_idx = find_seq_idx(query_start_len_ptr, q_ind, num_seqs, BLOCK_Q, False)
     q_block_start_idx = tl.load(query_start_len_ptr + seq_idx)
     q_block_local_idx = q_ind - q_block_start_idx
@@ -467,7 +474,10 @@ def _kernel_unified_attention_sparse_mla_csr_3d(
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
 
     query_mask_0 = query_pos < cur_batch_query_len
-    query_mask_1 = query_offset_1 < num_query_heads
+    # Lane mask: at heads < BLOCK_M (e.g. GLM-5 heads=8), lanes >= num_query_heads
+    # would otherwise alias into the next query token via offs_m // num_queries_per_kv.
+    # Combine with the per-head bound so those lanes never load/store.
+    query_mask_1 = (query_offset_1 < num_query_heads) & (offs_m < num_query_heads)
 
     if ALL_DECODE or BLOCK_M >= num_query_heads:
         Q_cache_modifier: tl.constexpr = ".cg"

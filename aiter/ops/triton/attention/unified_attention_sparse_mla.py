@@ -1,6 +1,7 @@
 import os
 
 import torch
+import triton
 
 from aiter.ops.triton._triton_kernels.attention.unified_attention_sparse_mla import (
     UA_SPARSE_MLA_AUTOTUNE,
@@ -68,10 +69,8 @@ def unified_attention_sparse_mla(
     cu_seqlens_q,
     max_seqlen_q,
     seqused_k,
-    max_seqlen_k,
     softmax_scale,
     topk_indices,
-    block_table,
     kv_lora_rank,
     kv_indptr=None,
     kv_indices=None,
@@ -90,7 +89,6 @@ def unified_attention_sparse_mla(
     topk_indices:  Optional [seq_len, TOP_K] int32
     kv_indptr:     Optional [seq_len + 1] int32
     kv_indices:    Optional [nnz] int32
-    block_table:   [BATCH, MAX_NUM_BLOCKS_PER_BATCH] int32
     kv_lora_rank:  int
     q_scale:       Optional scalar tensor or python float for per-tensor FP8 Q scale
     k_scale:       Optional scalar tensor or python float for per-tensor FP8 K scale
@@ -116,8 +114,6 @@ def unified_attention_sparse_mla(
     Q_SCALE = q_scale_t is not None
     K_SCALE = k_scale_t is not None
     V_SCALE = v_scale_t is not None
-    HAS_FP8 = Q_SCALE or K_SCALE or V_SCALE
-
     block_size = kv.shape[1]
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
@@ -129,37 +125,37 @@ def unified_attention_sparse_mla(
     v = kv[..., :kv_lora_rank]
 
     BLOCK_M = 16
-    total_num_q_blocks = q.shape[0] * (num_query_heads // BLOCK_M)
+    # ceil-div so shapes with num_query_heads < BLOCK_M (e.g. GLM-5 heads=8)
+    # still launch at least one program per query token; the kernel masks
+    # lanes >= num_query_heads inside each BLOCK_M tile.
+    total_num_q_blocks = q.shape[0] * triton.cdiv(num_query_heads, BLOCK_M)
     ALL_DECODE = max_seqlen_q == 1
 
     ROPE_RANK = head_size - kv_lora_rank
     KV_LORA_RANK = kv_lora_rank
 
-    DEFAULT_TILE_SIZE = 64
-    DEFAULT_NUM_WARPS = 4
-    DEFAULT_NUM_STAGES = 1
-    DEFAULT_PRELOAD_V = False
-    DEFAULT_WAVES_PER_EU = 1
+    # 2D defaults — dense top-k and CSR share everything except waves_per_eu.
+    # Dense default = 1 (historical); CSR default = 2 (heads=128 b=64 winner —
+    # collapsing to 1 regresses CSR by 32% at that shape, A/B-verified).
+    DEFAULT_2D_CFG = dict(
+        TILE_SIZE=64,
+        PRELOAD_V=False,
+        num_warps=4,
+        num_stages=1,
+        waves_per_eu=2 if use_csr else 1,
+    )
 
-    # Tuned defaults for the 2D CSR path (used when CSR is enabled but the GPU
-    # is already filled — high batch * heads, so 3D split-K's extra parallelism
-    # buys nothing). PRELOAD_V=True + waves_per_eu=2 sweep winners on
-    # heads=128 batch=64 (GLM-5/DSA decode shape): 0.6147 -> 0.4405 ms (28%).
-    DEFAULT_2D_CSR_TILE_SIZE = 64
-    DEFAULT_2D_CSR_NUM_WARPS = 4
-    DEFAULT_2D_CSR_NUM_STAGES = 1
-    DEFAULT_2D_CSR_PRELOAD_V = True
-    DEFAULT_2D_CSR_WAVES_PER_EU = 2
-
-    # Tuned defaults for the 3D split-K path. Picked from autotune sweep on
-    # GLM-5 decode shapes (heads=16, lora=512, rope=64, block=64, sk=8192,
-    # top_k=2048) over batches 1..64. Best config: TILE_SIZE=32, PRELOAD_V=True,
-    # num_warps=8, num_stages=2, waves_per_eu=2.
-    DEFAULT_3D_TILE_SIZE = 32
-    DEFAULT_3D_NUM_WARPS = 8
-    DEFAULT_3D_NUM_STAGES = 2
-    DEFAULT_3D_PRELOAD_V = True
-    DEFAULT_3D_WAVES_PER_EU = 2
+    # 3D split-K defaults — heads=8 and heads=16 regimes share num_warps and
+    # waves_per_eu; TILE_SIZE / num_stages / PRELOAD_V diverge.
+    #   heads <= 8   GLM-5 b=1 winner (lora=512, rope=64, block=64, sk=2048,
+    #                top_k=2048; the b=1 case 3D split-K exists to serve —
+    #                beats ASM mla_decode_fwd ~1.7x there).
+    #   heads >= 16  prior tuning target (sk=8192 heads=16 b=1 winner). Kept
+    #                so heads=16 callers don't regress under the heads=8 shape.
+    # Other heads / decode geometries should enable UNIFIED_ATTENTION_SPARSE_MLA_AUTOTUNE=1.
+    DEFAULT_3D_CFG = dict(num_warps=8, waves_per_eu=2, TILE_SIZE=32, num_stages=2, PRELOAD_V=True)
+    if num_query_heads <= 8:
+        DEFAULT_3D_CFG.update(TILE_SIZE=64, num_stages=1, PRELOAD_V=False)
 
     if use_csr:
         effective_len = max_sparse_len
@@ -172,7 +168,7 @@ def unified_attention_sparse_mla(
         )
 
         if use_split_k:
-            tile_for_seg = DEFAULT_TILE_SIZE
+            tile_for_seg = DEFAULT_2D_CFG["TILE_SIZE"]
             num_segments = _choose_num_segments(
                 total_num_q_blocks, effective_len, tile_for_seg
             )
@@ -245,11 +241,7 @@ def unified_attention_sparse_mla(
             else:
                 _kernel_unified_attention_sparse_mla_csr_3d[grid_3d](
                     **kernel_kwargs,
-                    TILE_SIZE=DEFAULT_3D_TILE_SIZE,
-                    PRELOAD_V=DEFAULT_3D_PRELOAD_V,
-                    num_warps=DEFAULT_3D_NUM_WARPS,
-                    num_stages=DEFAULT_3D_NUM_STAGES,
-                    waves_per_eu=DEFAULT_3D_WAVES_PER_EU,
+                    **DEFAULT_3D_CFG,
                 )
 
             _kernel_unified_attention_sparse_mla_csr_reduce[
@@ -320,11 +312,7 @@ def unified_attention_sparse_mla(
         else:
             _kernel_unified_attention_sparse_mla_2d[(total_num_q_blocks,)](
                 **kernel_kwargs,
-                TILE_SIZE=DEFAULT_2D_CSR_TILE_SIZE,
-                PRELOAD_V=DEFAULT_2D_CSR_PRELOAD_V,
-                num_warps=DEFAULT_2D_CSR_NUM_WARPS,
-                num_stages=DEFAULT_2D_CSR_NUM_STAGES,
-                waves_per_eu=DEFAULT_2D_CSR_WAVES_PER_EU,
+                **DEFAULT_2D_CFG,
             )
         return
 
@@ -376,9 +364,5 @@ def unified_attention_sparse_mla(
     else:
         _kernel_unified_attention_sparse_mla_2d[(total_num_q_blocks,)](
             **kernel_kwargs,
-            TILE_SIZE=DEFAULT_TILE_SIZE,
-            PRELOAD_V=DEFAULT_PRELOAD_V,
-            num_warps=DEFAULT_NUM_WARPS,
-            num_stages=DEFAULT_NUM_STAGES,
-            waves_per_eu=DEFAULT_WAVES_PER_EU,
+            **DEFAULT_2D_CFG,
         )
