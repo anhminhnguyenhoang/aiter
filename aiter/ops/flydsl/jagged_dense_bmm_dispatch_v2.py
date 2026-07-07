@@ -79,6 +79,7 @@ import weakref
 from pathlib import Path
 from typing import Optional
 
+from .kernels.jagged_dense_bmm_gen import BLOCK_M as _KERNEL_BLOCK_M
 from .kernels.jagged_dense_bmm_gen import jagged_dense_bmm
 from .kernels.jagged_dense_bmm_persist_dev import jagged_dense_bmm as jagged_dense_bmm_persist
 from .kernels.jdbba_skew_tile_map import build_tile_map_device_fused
@@ -220,9 +221,13 @@ def clear_skew_tile_map_cache() -> None:
 def _skew_compact_enabled(*, uniform_seqlen: bool, n_groups: int, arch: Optional[str]) -> bool:
     if uniform_seqlen or n_groups > SKEW_COMPACT_MAX_GROUPS:
         return False
-    # Measured on gfx942; disable on gfx95x until re-validated there.
+    # Measured a win on gfx942 AND gfx95x. On gfx95x it was gated off until the
+    # TILE_MAP block_m was decoupled from the uniform tile_m winner (2026-07-06):
+    # with that fix compact is cos=1.0 + a win on every headline skew cell
+    # (B120_D256 0.95x->1.29x, B120_D512 0.95x->1.14x, B1024_D512 0.95x->1.19x).
+    # Env override JDBBA_SKEW_COMPACT_GFX95X=0 forces it OFF for A/B debugging.
     if arch and arch.lower().startswith("gfx95"):
-        return False
+        return os.environ.get("JDBBA_SKEW_COMPACT_GFX95X", "1") == "1"
     return True
 
 
@@ -441,11 +446,18 @@ def jagged_dense_bmm_dispatched(
     arch = _detect_arch()
     is_gfx95x = bool(arch) and arch.lower().startswith("gfx95")
     total_out = n_groups * output_n * max_seq_len
+    # Persist was the small-weight/large-B skew winner UNTIL the compact grid was
+    # fixed + enabled on gfx95x (2026-07-06): compact now beats persist on
+    # B1024_D256 skew (0.373 vs 0.450 ms, 0.96x->1.16x vs Triton, cos=1.0). So
+    # persist is now only the fallback for n_groups the compact path can't hold
+    # (> SKEW_COMPACT_MAX_GROUPS); the compact block below takes every headline
+    # skew cell. (Compact is checked after this gate, but its own enable predicate
+    # excludes n_groups > SKEW_COMPACT_MAX_GROUPS, so the two are disjoint.)
     use_persist = (
         is_gfx95x
         and (not uniform_seqlen)
         and output_n <= 256
-        and n_groups >= 1024
+        and n_groups > SKEW_COMPACT_MAX_GROUPS
         and total_out >= (256 * 256 * 4096)
     )
     if use_persist:
@@ -455,7 +467,12 @@ def jagged_dense_bmm_dispatched(
     # TILE_MAP is built on-device once per seq_offsets buffer (cached); L is
     # host-known (needed to size the packed output) so grid_x needs no readback.
     if _skew_compact_enabled(uniform_seqlen=uniform_seqlen, n_groups=n_groups, arch=arch):
-        block_m = int(cfg.get("tile_m") or 128)
+        # The compact kernel call below forwards NO block_m/block_n, so the kernel
+        # runs at its default BLOCK_M. The TILE_MAP MUST be built at that SAME
+        # BLOCK_M -- using the uniform winner's tile_m (e.g. the gfx950 B1024_D512
+        # 256x256 tile) mis-sizes the map vs the 128-row kernel tiles and both
+        # mis-maps rows and under-sizes grid_x (observed cos=0.728). Decouple it.
+        block_m = _KERNEL_BLOCK_M
         tile_map, ub = _get_skew_tile_map(SEQ_OFFSETS, n_groups, max_seq_len, block_m)
         sc_xcd_c, sc_xcd_w = _skew_compact_xcd(n_groups, reduction_k)
         return jagged_dense_bmm(

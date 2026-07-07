@@ -100,9 +100,9 @@
           "tile_n": 128,
           "use_mfma_k32": true,
           "waves_per_eu": 1,
-          "xcd_c": 32,
-          "xcd_w": 8,
-          "source": "wpe-probe (gfx950 MI355X, 2026-06-10): do_bench cold-L2 uniform, waves_per_eu=1 -> ~2.13ms vs ~2.20ms (all wpe>0 trials beat all baseline trials, ~2.6%), cos=1.0. _wpe_probe via CompilationContext.compile_hints. Occupancy hint on the overhead-bound D256 shape."
+          "xcd_c": 48,
+          "xcd_w": 24,
+          "source": "dense XCD re-sweep (gfx950 MI355X, 2026-07-07, tune_jdbba_xcd.py grid c={40..160} w={4..24}): xcd_c=48/xcd_w=24 -> 2.134ms vs 2.169 at c=60/w=16 (+1.6% e2e A/B, 2/2 runs 2.129/2.139), cos=1.0. Flips B1024_D256 uniform from parity to ~1.026x AHEAD of Triton (2.134 vs 2.19). Prior: c=60/w=16 (2026-07-06). tune_jdbba_xcd.py --xcd-c 40 48 56 60 64 72 80 90 --xcd-w 8 12 16 24."
         },
         "B1024D512K512N7680": {
           "b_to_lds": false,
@@ -120,7 +120,7 @@
           "xcd_w": 8,
           "skew_xcd_c": 8,
           "skew_xcd_w": 8,
-          "source": "tile-fold (gfx950 MI355X, 2026-06-10): do_bench cold-L2 uniform, 256x256 tile + xcd_c=120 -> 5.82ms vs 5.98ms at 128x128 (-2.7%), cos=1.0. 256x256 needs 128KB epilogue LDS (fits CDNA4 160KB, not CDNA3 64KB). tune_jdbba_tiles.py. SKEW: skew_xcd_c=8 (NOT remap-off) -> 1.23ms vs 1.26 (-1.7%, 5/5 trials); for this large-D512 skew shape the L2-reuse of a modest chunk beats the load-imbalance penalty."
+          "source": "tile-fold (gfx950 MI355X, 2026-06-10): do_bench cold-L2 uniform, 256x256 tile + xcd_c=120 -> 5.82ms vs 5.98ms at 128x128 (-2.7%), cos=1.0. 256x256 needs 128KB epilogue LDS (fits CDNA4 160KB, not CDNA3 64KB). SKEW: skew_xcd_c=8 (NOT remap-off) -> 1.23ms vs 1.26 (-1.7%, 5/5 trials); for this large-D512 skew shape the L2-reuse of a modest chunk beats the load-imbalance penalty. RE-SWEEP 2026-07-06 (FlyDSL 0.2.2, finer c in {48,56,60,64,72,90,120}x{8,16}, dual-run on gpu0): c=60 and c=120 TIE (~5.46-5.50ms both); c=48/c=64 are cliffs (~6.0ms). Kept documented c=120 (c=60 within-noise, not a robust >1% win)."
         },
         "B120D256K256N7680": {
           "b_to_lds": false,
@@ -134,8 +134,9 @@
           "tile_n": 128,
           "use_mfma_k32": true,
           "waves_per_eu": 0,
-          "xcd_c": 60,
-          "xcd_w": 8
+          "xcd_c": 48,
+          "xcd_w": 24,
+          "source": "dense XCD re-sweep (gfx950 MI355X, 2026-07-07, tune_jdbba_xcd.py grid c={40..160} w={4..24}): xcd_c=48/xcd_w=24 -> 0.2707ms vs 0.2806 at c=60/w=8 (+3.5% e2e A/B, 2/2 runs 0.2707/0.2708), cos=1.0. Flips B120_D256 uniform from parity to ~1.02x AHEAD of Triton (0.2707 vs 0.276)."
         },
         "B120D512K512N7680": {
           "b_to_lds": false,
@@ -158,9 +159,9 @@
           "tile_n": 128,
           "use_mfma_k32": true,
           "waves_per_eu": 1,
-          "xcd_c": 32,
-          "xcd_w": 8,
-          "source": "Mi=16384 deployment sweep (gfx950, 2026-06-10, do_bench cold-L2 uniform): 128x128 wpe=1 -> 0.561ms vs 0.565 heuristic. _mi16k_winners.py. cos=1.0."
+          "xcd_c": 90,
+          "xcd_w": 16,
+          "source": "XCD re-sweep (gfx950 MI355X, 2026-07-07, do_bench cold-L2 uniform, tune_jdbba_xcd.py): xcd_c=90/xcd_w=16 -> 0.5640ms vs 0.5754 at c=32/w=8 (+2.0% e2e), cos=1.0. Ports the 2026-07-06 headline 'w=16 on D256' win to Mi=16384; D256 optimum shifts c=60->90 at Mi=16384. Tile stays 128x128."
         },
         "B120D512K512N16384": {
           "cos": 1.0,
@@ -178,9 +179,9 @@
           "tile_n": 128,
           "use_mfma_k32": true,
           "waves_per_eu": 1,
-          "xcd_c": 32,
-          "xcd_w": 8,
-          "source": "Mi=16384 deployment sweep (gfx950, 2026-06-10): 128x128 wpe=1 -> 4.429ms vs 4.445 heuristic. _mi16k_winners.py. cos=1.0."
+          "xcd_c": 90,
+          "xcd_w": 16,
+          "source": "XCD re-sweep (gfx950 MI355X, 2026-07-07, do_bench cold-L2 uniform, tune_jdbba_xcd.py): xcd_c=90/xcd_w=16 -> 4.4862ms vs 4.6529 at c=32/w=8 (+3.7% e2e), cos=1.0. Ports the 2026-07-06 headline 'w=16 on D256' win to Mi=16384; D256 optimum shifts c=60->90 at Mi=16384. Tile stays 128x128."
         },
         "B1024D512K512N16384": {
           "cos": 1.0,
@@ -191,6 +192,16 @@
           "xcd_c": 120,
           "xcd_w": 8,
           "source": "Mi=16384 deployment sweep (gfx950, 2026-06-10): 256x256 -> 12.44ms vs 12.85 at 128x128 (-3.2%). 256x256 needs 128KB LDS (CDNA4 only). _mi16k_winners.py. cos=1.0."
+        },
+        "B64D512K1024N8192": {
+          "cos": 1.0,
+          "tile_m": 256,
+          "tile_n": 256,
+          "use_mfma_k32": true,
+          "waves_per_eu": 0,
+          "xcd_c": 60,
+          "xcd_w": 8,
+          "source": "Songlin MoE deploy fold (gfx950 MI355X, 2026-07-07, _tile_fold_probe.py direct-call within-run A/B, do_bench cold-L2 uniform, 3 runs): tile 128x128->256x256 -> 0.739ms vs 0.806 (-8.25%, 742-750 TFLOPS vs 682), cos=1.0. ~97% of hipBLASLt dense ceiling (766 TFLOPS). 256x256 needs 128KB epilogue LDS (reuses A-stage region; fits CDNA4 160KB). xcd_c=60/w=8 already optimal for the folded tile (swept c={32,48,60,90,120,240}xw={8,16}: c=60/w=8 best; c>=120 collapses ~2.2ms). Partial folds regress (256x128 +13%, 128x256 +24%, 128x512 +8%). Skew unaffected (compact path uses kernel BLOCK_M=128)."
         }
       },
       "fallback": {
