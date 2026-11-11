@@ -12,8 +12,9 @@ computes a D/BLOCK_Q slice of the output for every query. Both modes:
   global into the other of two LDS buffers (ping-pong)
 * compute S^T (token on M, head on N): each lane owns one head, the softmax
   reduces across lanes 16 and 32 apart, and P^T is already the PV B operand
-* compute out^T = V^T P^T; a lane owns four adjacent d, so one 8-byte V read
-  per token feeds four MFMAs
+* compute out^T = V^T P^T. gfx942: a lane owns four adjacent d, so one 8-byte
+  V read per token feeds four MFMAs. gfx950: one ``ds_read_b64_tr_b16`` hands a
+  lane four tokens of one d, so the reads are the A operand with no repack
 
 ``v_mfma_f32_16x16x16_bf16`` fragment map (device probe):
 
@@ -183,6 +184,8 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
     # buffers: 32 staged rows spill BQ=4 past 256 VGPRs. BQ=2 keeps VGPR staging into one buffer.
     DMA = CDNA4 and (ONE_Q or BLOCK_K == 32)
     N_BUF = 2 if DMA else 1
+    # gfx950 reads the PV A operand (V^T) with ds_read_b64_tr_b16: no VALU repack.
+    VT_TR = CDNA4
     module_name = (
         f"sparse_mla_mfma_bq{BLOCK_Q}_sink{int(HAS_SINK)}_d{HEAD_DIM}_h{NUM_HEADS}"
         f"{'_prefill' if PREFILL else ''}"
@@ -197,10 +200,10 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
     # bits per copy of 4 and 8 bf16
     COPY_BITS = {4: 64, 8: 128}
 
-    def _lds_load(view, n):
+    def _lds_load(view, n, op=None):
         # A swizzled (composed-layout) view has no vector load, only copy atoms.
         r = fx.make_rmem_tensor(fx.make_layout(n, 1), fx.BFloat16)
-        fx.copy(fx.make_copy_atom(fx.UniversalCopy(COPY_BITS[n]), fx.BFloat16), view, r)
+        fx.copy(fx.make_copy_atom(op if op is not None else fx.UniversalCopy(COPY_BITS[n]), fx.BFloat16), view, r)
         return r.load()
 
     def _lds_store(vec, view, n):
@@ -232,7 +235,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         PV_D_TILES = _py(fx.shape_div(n_d_tiles, NPV))
         CHUNKS = _ext(fx.zipped_divide(fx.make_layout(HEAD_DIM, 1), (VEC,)), 1)
         # QK takes the tiles in pairs (one 16-B load feeds tiles 2p, 2p+1: two K=16 or one K=32 MFMA),
-        # PV in groups of 4 (one V^T row read feeds tiles 4g .. 4g+3).
+        # PV in groups of 4 (gfx942: one V^T row read feeds tiles 4g .. 4g+3).
         qk_tiles = fx.zipped_divide(fx.make_layout(QK_D_TILES, 1), (2,))  # (half, pair)
         pv_tiles = fx.zipped_divide(fx.make_layout(PV_D_TILES, 1), (4,))  # (h, group)
         QK_PAIRS = _ext(qk_tiles, 1)
@@ -290,8 +293,12 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         # ---- memory layouts: every address below is a coordinate into one of these (elements)
         # q[token, head, qk wave, pair, k-group, 8]: MFMAs 2p, 2p+1 from one 16-B load
         q_g = fx.make_view(fx.rocdl.make_buffer_ptr(q_ptr), _rowmajor(BIG, NUM_HEADS, NQK, QK_PAIRS, 4, VEC))
-        # out[token, head, pv wave, group, k-group, i, h]: acc (h, g)[i] is d = 64 g + 16 k-group + 4 i + h
-        out_g = fx.make_view(fx.rocdl.make_buffer_ptr(out_ptr), _rowmajor(BIG, NUM_HEADS, NPV, PV_GROUPS, 4, 4, H4))
+        # out[token, head, pv wave, group, k-group, i, h]: acc (h, g)[i] is d = 64 g + 16 k-group + 4 i + h.
+        # VT_TR: out[token, head, pv wave, group, h, k-group, i], d = 64 g + 16 h + 4 k-group + i.
+        if const_expr(VT_TR):
+            out_g = fx.make_view(fx.rocdl.make_buffer_ptr(out_ptr), _rowmajor(BIG, NUM_HEADS, NPV, PV_GROUPS, H4, 4, 4))
+        else:
+            out_g = fx.make_view(fx.rocdl.make_buffer_ptr(out_ptr), _rowmajor(BIG, NUM_HEADS, NPV, PV_GROUPS, 4, 4, H4))
         # idx rows of n_unique, tiled by BLOCK_K: ((0, lane in tile), (row, k-tile)); the tile -> soffset
         n_u = fx.Int32(n_unique)
         idx_tiles = fx.zipped_divide(_rowmajor(BIG, n_u), (1, BLOCK_K))
@@ -341,6 +348,9 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         vt_cols = _rowmajor(NPV, PV_GROUPS, 64)
         vt_tok = fx.composition(rows, _colmajor(4, 4, N_ST))  # token (e, k-group, S^T tile) -> row offset
         vt_rows = _swz(fx.make_layout((fx.get_shape(vt_tok), 16, 4), (fx.get_stride(vt_tok), 4, 1)))
+        # Transpose read [(q, e) = lane_row, k-group, S^T tile, h, 4]: token 16 tile + 4 k-group + e,
+        # d 16h + 4q .. +3. The 16-lane transpose hands lane (r, k-group) d = 16h + r for those four tokens.
+        vt_tr = _swz(fx.make_layout(((4, 4), 4, N_ST, H4, 4), ((4, LD), 4 * LD, 16 * LD, 16, 1)))
         # one-query QK partials [(lane % 32, lane // 32), wave, 8], over the V^T rows already read
         part_l = fx.make_ordered_layout(((32, 2), NWARP, VEC), ((1, 3), 2, 0))
         # wave w's peer, 1 - w (one-query: two waves)
@@ -365,6 +375,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         mma_qk = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, QK_K, fx.BFloat16))
         if const_expr(DMA):
             dma_atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
+        tr_op = fx.rocdl.cdna4.LDSReadTrans16_64b() if const_expr(VT_TR) else None
 
         # QK pair p over one 16-B load per lane: lane (g, s) owns dims 32p + 8g .. +7,
         # one half per MFMA (K=16: low half for tile 2p, high half for 2p+1).
@@ -424,7 +435,21 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
 
         def _vt_rows(kv, g):
             # P^T element order: (e, S^T tile)
-            vt_op = (kv + fx.crd2idx((pv_w, g, 0), vt_cols)).view(vt_rows)
+            base = kv + fx.crd2idx((pv_w, g, 0), vt_cols)
+            if const_expr(VT_TR):
+                vt_op = base.view(vt_tr)
+                return [
+                    fx.Vector.from_elements(
+                        [
+                            fx.Vector(_lds_load(vt_op[lane_row, lane_g, c, h, None], 4, tr_op))[e]
+                            for c in range_constexpr(N_ST)
+                            for e in range_constexpr(4)
+                        ],
+                        fx.BFloat16,
+                    )
+                    for h in range_constexpr(H4)
+                ]
+            vt_op = base.view(vt_rows)
             return [
                 _lds_load(vt_op[(e, lane_g, c), lane_row, None], 4)
                 for c in range_constexpr(N_ST)
@@ -432,8 +457,10 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
             ]
 
         def _vt_group(kv, g, raw=None):
-            # A operands for tiles (h, g): row r is d = 64g + 4r + h.
+            # A operands for tiles (h, g): row r is d = 64g + 4r + h (VT_TR: 64g + 16h + r).
             rows_g = [fx.Vector(r) for r in (raw if raw is not None else _vt_rows(kv, g))]
+            if const_expr(VT_TR):
+                return rows_g
             return [
                 fx.Vector.from_elements([r[h] for r in rows_g], fx.BFloat16)
                 for h in range_constexpr(H4)
@@ -652,9 +679,13 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
 
         def _store_out(t_q, j, inv):
             for g in range_constexpr(PV_GROUPS):
-                for i in range_constexpr(4):
-                    vals = [_to_bf16(_elem(_acc_at(acc, h, g, j), i) * inv) for h in range_constexpr(H4)]
-                    out_g[t_q, head, pv_w, g, lane_g, i, None].store(fx.Vector.from_elements(vals, fx.BFloat16))
+                for s in range_constexpr(4):
+                    if const_expr(VT_TR):
+                        vals = [_to_bf16(_elem(_acc_at(acc, s, g, j), i) * inv) for i in range_constexpr(4)]
+                    else:
+                        vals = [_to_bf16(_elem(_acc_at(acc, h, g, j), s) * inv) for h in range_constexpr(H4)]
+                    a, b = (s, lane_g) if const_expr(VT_TR) else (lane_g, s)
+                    out_g[t_q, head, pv_w, g, a, b, None].store(fx.Vector.from_elements(vals, fx.BFloat16))
 
         if const_expr(ONE_Q):
             inv = _inv(m_i, l_i)
