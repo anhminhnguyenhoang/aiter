@@ -8,7 +8,7 @@ one wave per query for QK and softmax over a shared KV tile, then each wave
 computes a D/BLOCK_Q slice of the output for every query. Both modes:
 
 * gather the next KV tile while the current tile's MFMA chain runs: coalesced
-  dwordx4 loads staged in VGPRs, or (one-query on gfx950) a DMA straight from
+  dwordx4 loads staged in VGPRs, or (gfx950 one-query and BQ=4) a DMA straight from
   global into the other of two LDS buffers (ping-pong)
 * compute S^T (token on M, head on N): each lane owns one head, the softmax
   reduces across lanes 16 and 32 apart, and P^T is already the PV B operand
@@ -22,6 +22,9 @@ computes a D/BLOCK_Q slice of the output for every query. Both modes:
 
 On gfx950 (CDNA4) QK uses ``v_mfma_f32_16x16x32_bf16``: lane holds
 A[lane % 16][(lane // 16) * 8 + e] for e < 8, same for B; the C map is the one above.
+BQ=4 Q-block on gfx950 takes 32-token KV tiles (two S^T tiles) and runs PV on it too:
+the contraction order is free, so K element e of lane group g is token
+16 (e // 4) + 4 g + e % 4, and a lane's two S^T fragments are its P^T operand as is.
 """
 
 from functools import lru_cache
@@ -102,6 +105,12 @@ def _head_max(m, head_xor):
     return m
 
 
+def _tree(vals, op):
+    while len(vals) > 1:
+        vals = [op(vals[i], vals[i + 1]) for i in range(0, len(vals), 2)]
+    return vals[0]
+
+
 def _rescale_all(acc, alpha):
     return [_scale_acc(a, [alpha] * 4) for a in acc]
 
@@ -140,6 +149,11 @@ def _halves(v8, halves):
     ]
 
 
+def kv_tile_tokens(block_q):
+    """KV tokens per main-loop iteration; topk must be a multiple."""
+    return 32 if block_q == 4 and get_gfx_runtime() == "gfx950" else 16
+
+
 @lru_cache(maxsize=16)
 def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
     if block_q not in (1, 2, 4):
@@ -155,7 +169,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
     NWARP = 2 if ONE_Q else BLOCK_Q
     # arithmetic: the launch shape is needed before tracing, where no layout exists yet
     BLOCK_THREADS = NWARP * WAVE
-    BLOCK_K = 16
+    BLOCK_K = kv_tile_tokens(BLOCK_Q)
     # D splits into 16-wide MFMA tiles: QK over NQK waves (one-query), PV over NPV waves.
     # Q-block: each wave owns a D/NWARP slice of the output for every query,
     # so one V^T operand feeds BLOCK_Q MFMAs; P^T and alpha go through LDS.
@@ -165,9 +179,9 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
     QK_K = 32 if CDNA4 else 16
     QK_K_LANE = QK_K // 4
     IDX_AHEAD = 0 if ONE_Q else IDX_AHEAD_QBLOCK
-    # One-query on gfx950 DMAs the KV tile into ping-pong LDS buffers. Q-block keeps
-    # VGPR staging into one buffer: the DMA measured no gain there (gfx950).
-    DMA = ONE_Q and CDNA4
+    # On gfx950, one-query and the 32-token Q-block DMA the KV tile into ping-pong LDS
+    # buffers: 32 staged rows spill BQ=4 past 256 VGPRs. BQ=2 keeps VGPR staging into one buffer.
+    DMA = CDNA4 and (ONE_Q or BLOCK_K == 32)
     N_BUF = 2 if DMA else 1
     module_name = (
         f"sparse_mla_mfma_bq{BLOCK_Q}_sink{int(HAS_SINK)}_d{HEAD_DIM}_h{NUM_HEADS}"
@@ -237,6 +251,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         # this wave's gather rows: (row it, wave) -> KV-tile row
         gather_rows = fx.zipped_divide(fx.make_layout(BLOCK_K, 1), (_py(fx.ceil_div(BLOCK_K, NWARP)),))
         N_GATHER = _ext(gather_rows, 0)
+        N_ST = _ext(fx.zipped_divide(fx.make_layout(BLOCK_K, 1), (16,)), 1)
 
         tid = fx.Int32(gpu.thread_id("x"))
         tc = fx.idx2crd(tid, _colmajor(WAVE, NWARP))
@@ -281,7 +296,8 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         n_u = fx.Int32(n_unique)
         idx_tiles = fx.zipped_divide(_rowmajor(BIG, n_u), (1, BLOCK_K))
         n_kt = fx.get_scalar(fx.size(fx.get_(fx.get_shape(idx_tiles), [1, 1])))
-        idx_lane = fx.make_view(fx.rocdl.make_buffer_ptr(idx_ptr), _rowmajor(BLOCK_K, 1))[lane_row, None]
+        idx_t = fx.get_(fx.idx2crd(lane, _colmajor(BLOCK_K, _py(fx.shape_div(WAVE, BLOCK_K)))), 0).unpack()
+        idx_lane = fx.make_view(fx.rocdl.make_buffer_ptr(idx_ptr), _rowmajor(BLOCK_K, 1))[idx_t, None]
         idx_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
         # tile kt + a: the next tiles a loop iteration loads ahead
         ahead = fx.make_layout((BIG, BIG), (1, 1))
@@ -293,28 +309,37 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         kv_tile_l = fx.make_layout((BLOCK_K, CHUNKS, VEC), (LD, VEC, 1))
         kv_bufs_l = fx.make_layout((N_BUF, BLOCK_K, CHUNKS, VEC), (_py(fx.cosize(kv_tile_l)), LD, VEC, 1))
         xch_l = _rowmajor(NWARP, WAVE, VEC)
+        # 32-token tile: P^T fills the 16-B slot, alpha (f32) moves to its own [wave, lane, 2]
+        xa_l = _rowmajor(NWARP, WAVE, 2)
         if const_expr(ONE_Q):
             @fx.struct
             class SharedStorage:
                 kv: fx.Array[fx.BFloat16, _py(fx.cosize(kv_bufs_l)), 16]
+        elif const_expr(N_ST == 1):
+            @fx.struct
+            class SharedStorage:
+                kv: fx.Array[fx.BFloat16, _py(fx.cosize(kv_bufs_l)), 16]
+                xch: fx.Array[fx.BFloat16, _py(fx.cosize(xch_l)), 16]
         else:
             @fx.struct
             class SharedStorage:
                 kv: fx.Array[fx.BFloat16, _py(fx.cosize(kv_bufs_l)), 16]
                 xch: fx.Array[fx.BFloat16, _py(fx.cosize(xch_l)), 16]
+                xa: fx.Array[fx.BFloat16, _py(fx.cosize(xa_l)), 16]
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         # LDS KV tile [row, 16-B chunk, 8]. The operand reads split D into 64-element column
         # blocks, which the swizzle never touches: the block is a pointer offset (an immediate),
-        # and the swizzled layout covers the rest. K: [token, pair % 2, k-group, 8] at block
-        # (qk wave, pair // 2); V^T rows: [(e, k-group), lane_row, 4] (token 4 k-group + e) at
-        # block (pv wave, group).
+        # and the swizzled layout covers the rest. K: [(token, S^T tile), pair % 2, k-group, 8] at
+        # block (qk wave, pair // 2); V^T rows: [(e, k-group, S^T tile), lane_row, 4]
+        # (token 16 tile + 4 k-group + e) at block (pv wave, group).
         rows = fx.make_layout(BLOCK_K, LD)
         kv_tile = storage.kv.view(_swz(kv_tile_l))
         k_cols = _rowmajor(NQK, _ext(k_pairs, 1), 64)
         k_in = _rowmajor(2, 4, VEC)  # (pair % 2, k-group, 8) within a row
-        k_rows = _swz(fx.make_layout((BLOCK_K, fx.get_shape(k_in)), (LD, fx.get_stride(k_in))))
+        k_tok = fx.composition(rows, _colmajor(16, N_ST))  # (token, S^T tile) -> row offset
+        k_rows = _swz(fx.make_layout((fx.get_shape(k_tok), fx.get_shape(k_in)), (fx.get_stride(k_tok), fx.get_stride(k_in))))
         vt_cols = _rowmajor(NPV, PV_GROUPS, 64)
-        vt_tok = fx.flat_divide(rows, (4,))  # token (e, k-group) -> row offset
+        vt_tok = fx.composition(rows, _colmajor(4, 4, N_ST))  # token (e, k-group, S^T tile) -> row offset
         vt_rows = _swz(fx.make_layout((fx.get_shape(vt_tok), 16, 4), (fx.get_stride(vt_tok), 4, 1)))
         # one-query QK partials [(lane % 32, lane // 32), wave, 8], over the V^T rows already read
         part_l = fx.make_ordered_layout(((32, 2), NWARP, VEC), ((1, 3), 2, 0))
@@ -324,6 +349,8 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         ml_pub = storage.kv.view(_rowmajor(NWARP, WAVE, 4))
         if const_expr(not ONE_Q):
             xch = storage.xch.view(xch_l)
+        if const_expr(not ONE_Q and N_ST > 1):
+            xa = storage.xa.view(xa_l)
 
         qk_scale = fx.Float32(scale) * fx.Float32(LOG2E)
         # Keep -inf / 0.0 as raw arith constants: ambient fast_fp_math would
@@ -334,7 +361,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         one_f = fx.Float32(arith.constant(1.0, type=T.f32))
         idx_row = q_row if const_expr(ONE_Q) else tile
         pv_w = warp
-        mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+        mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, BLOCK_K, fx.BFloat16))
         mma_qk = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, QK_K, fx.BFloat16))
         if const_expr(DMA):
             dma_atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
@@ -389,21 +416,26 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
                 # warp_v (VGPR): the lane base absorbs the wave's rows, so row `it` is an immediate.
                 _lds_store(fx.Vector(frags[it]), kv_tile[fx.crd2idx((it, warp_v), gather_rows), lane, None], VEC)
 
-        def _k_a(kv, pr):
-            # A operands for pair pr's MFMAs: K[token = lane_row][d of q_frags[pr]].
+        def _k_a(kv, pr, c):
+            # A operands for pair pr's MFMAs on S^T tile c: K[token = (lane_row, c)][d of q_frags[pr]].
             sub, blk = _py(fx.get_flat_coord(pr, k_pairs))
             k_op = (kv + fx.crd2idx((qk_w, blk, 0), k_cols)).view(k_rows)
-            return _halves(_lds_load(k_op[lane_row, (sub, lane_g, None)], VEC), halves)
+            return _halves(_lds_load(k_op[(lane_row, c), (sub, lane_g, None)], VEC), halves)
 
         def _vt_rows(kv, g):
+            # P^T element order: (e, S^T tile)
             vt_op = (kv + fx.crd2idx((pv_w, g, 0), vt_cols)).view(vt_rows)
-            return [_lds_load(vt_op[(e, lane_g), lane_row, None], 4) for e in range_constexpr(4)]
+            return [
+                _lds_load(vt_op[(e, lane_g, c), lane_row, None], 4)
+                for c in range_constexpr(N_ST)
+                for e in range_constexpr(4)
+            ]
 
         def _vt_group(kv, g, raw=None):
             # A operands for tiles (h, g): row r is d = 64g + 4r + h.
             rows_g = [fx.Vector(r) for r in (raw if raw is not None else _vt_rows(kv, g))]
             return [
-                fx.Vector.from_elements([rows_g[e][h] for e in range_constexpr(4)], fx.BFloat16)
+                fx.Vector.from_elements([r[h] for r in rows_g], fx.BFloat16)
                 for h in range_constexpr(H4)
             ]
 
@@ -460,24 +492,29 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
                 next_prefetched = _gather(idx_cur, _kv_buf(kt_next))
             fx.rocdl.sched_barrier(0)
 
-            # One accumulator chain per half, summed after the chain.
-            s_accs = [_zero4() for _ in range_constexpr(HALVES)]
+            # One accumulator chain per (S^T tile, half), the halves summed after the chain.
+            s_accs = [[_zero4() for _ in range_constexpr(HALVES)] for _ in range_constexpr(N_ST)]
             fx.rocdl.s_setprio(1)
             for b in range_constexpr(_ext(qk_batches, 1)):
                 pairs = [_py(fx.crd2idx((p, b), qk_batches)) for p in range_constexpr(_ext(qk_batches, 0))]
-                buf = [_k_a(kv, pr) for pr in pairs]
+                buf = [[_k_a(kv, pr, c) for pr in pairs] for c in range_constexpr(N_ST)]
                 fx.rocdl.sched_barrier(0)
-                for pr, k in zip(pairs, buf):
-                    for h in range_constexpr(HALVES):
-                        s_accs[h] = _mfma_ssa(mma_qk, k[h], q_frags[pr][h], s_accs[h])
-            s_acc = s_accs[0]
-            for a in s_accs[1:]:
-                s_acc = fx.Vector.from_elements(
-                    [_elem(s_acc, i) + _elem(a, i) for i in range_constexpr(4)], fx.Float32
-                )
+                for c in range_constexpr(N_ST):
+                    for pr, k in zip(pairs, buf[c]):
+                        for h in range_constexpr(HALVES):
+                            s_accs[c][h] = _mfma_ssa(mma_qk, k[h], q_frags[pr][h], s_accs[c][h])
+            s_tiles = []
+            for c in range_constexpr(N_ST):
+                s_acc = s_accs[c][0]
+                for a in s_accs[c][1:]:
+                    s_acc = fx.Vector.from_elements(
+                        [_elem(s_acc, i) + _elem(a, i) for i in range_constexpr(4)], fx.Float32
+                    )
+                s_tiles.append(s_acc)
 
             fx.rocdl.s_setprio(0)
             if const_expr(ONE_Q):
+                s_acc = s_tiles[0]
                 # Read this wave's whole V^T slice first: the partial below overwrites
                 # rows 0-1 of the same D half (LDS ops retire in order per wave).
                 v_raw = [_vt_rows(kv, g) for g in range_constexpr(PV_GROUPS)]
@@ -487,17 +524,18 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
                 gpu.barrier()
                 peer_w = fx.get_scalar(fx.crd2idx(warp, peer_of))
                 peer = fx.Vector(part[lane, peer_w, None].load()).bitcast(fx.Float32)
-                s_acc = fx.Vector.from_elements(
+                s_tiles = [fx.Vector.from_elements(
                     [_elem(s_acc, i) + peer[i] for i in range_constexpr(4)], fx.Float32
-                )
+                )]
 
-            scores = [live.select(_elem(s_acc, i), neg_inf) for i in range_constexpr(4)]
+            # scores[4 c + i]: token 16 c + lane_k + i
+            scores = [live.select(_elem(s, i), neg_inf) for s in s_tiles for i in range_constexpr(4)]
             if const_expr(PREFILL):
-                m_w = fx.max(fx.max(scores[0], scores[1]), fx.max(scores[2], scores[3]))
+                m_w = _tree(scores, fx.max)
             else:
                 m_w = scores[0]
-                for i in range_constexpr(1, 4):
-                    m_w = (m_w > scores[i]).select(m_w, scores[i])
+                for s in scores[1:]:
+                    m_w = (m_w > s).select(m_w, s)
             # Lazy rescale: keep the stale head max until some lane's local max grows by
             # more than RESCALE_TAU (log2 units), so p <= 2**RESCALE_TAU. Only then is the
             # cross-lane head max needed. -inf - -inf is NaN -> no move.
@@ -513,12 +551,12 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
             empty = m_n == neg_inf
 
             p_t = []
-            for i in range_constexpr(4):
-                p = empty.select(zero_f, _exp2((scores[i] - m_n) * qk_scale))
+            for s in scores:
+                p = empty.select(zero_f, _exp2((s - m_n) * qk_scale))
                 p_t.append(live.select(p, zero_f))
             # l stays a per-lane partial (alpha is uniform across the head's
             # four lanes); the cross-lane sum happens once after the loop.
-            l_i = l_i * alpha + ((p_t[0] + p_t[1]) + (p_t[2] + p_t[3]))
+            l_i = l_i * alpha + _tree(p_t, lambda a, b: a + b)
             m_i = m_n
             p_b = fx.Vector.from_elements([_to_bf16(p) for p in p_t], fx.BFloat16)
 
@@ -534,20 +572,32 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
                             acc[t] = _mfma_ssa(mma, vg[h], p_b, acc[t])
                 fx.rocdl.s_setprio(0)
             else:
-                pf = p_b.bitcast(fx.Float32)
-                xch[warp_v, lane, None].store(
-                    fx.Vector.from_elements([pf[0], pf[1], alpha, zero_f], fx.Float32).bitcast(fx.BFloat16)
-                )
+                if const_expr(N_ST == 1):
+                    pf = p_b.bitcast(fx.Float32)
+                    xch[warp_v, lane, None].store(
+                        fx.Vector.from_elements([pf[0], pf[1], alpha, zero_f], fx.Float32).bitcast(fx.BFloat16)
+                    )
+                else:
+                    xch[warp_v, lane, None].store(p_b)
+                    xa[warp_v, lane, None].store(fx.Vector.from_elements([alpha], fx.Float32).bitcast(fx.BFloat16))
                 fx.rocdl.sched_barrier(0)
                 gpu.barrier()
                 fx.rocdl.sched_barrier(0)
-                xs = [
-                    fx.Vector(xch[j, lane, None].load()).bitcast(fx.Float32)
-                    for j in range_constexpr(BLOCK_Q)
-                ]
-                p_bs = [fx.Vector.from_elements([x[0], x[1]], fx.Float32).bitcast(fx.BFloat16) for x in xs]
+                if const_expr(N_ST == 1):
+                    xs = [
+                        fx.Vector(xch[j, lane, None].load()).bitcast(fx.Float32)
+                        for j in range_constexpr(BLOCK_Q)
+                    ]
+                    p_bs = [fx.Vector.from_elements([x[0], x[1]], fx.Float32).bitcast(fx.BFloat16) for x in xs]
+                    alphas = [fx.Float32(x[2]) for x in xs]
+                else:
+                    p_bs = [fx.Vector(xch[j, lane, None].load()) for j in range_constexpr(BLOCK_Q)]
+                    alphas = [
+                        fx.Float32(fx.Vector(xa[j, lane, None].load()).bitcast(fx.Float32)[0])
+                        for j in range_constexpr(BLOCK_Q)
+                    ]
                 for j in range_constexpr(BLOCK_Q):
-                    alpha_j = fx.Float32(xs[j][2])
+                    alpha_j = alphas[j]
                     # alpha is exactly 1 unless query j's max moved: skip when no lane's did.
                     moved_j = fx.Int64(fx.rocdl.ballot(fx.Int64.ir_type, alpha_j != one_f))
                     if moved_j != fx.Int64(0):

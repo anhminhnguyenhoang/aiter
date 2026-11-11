@@ -15,6 +15,7 @@ from aiter.ops.flydsl.kernels.sparse_mla_qblock import (
     HEAD_DIM,
     NUM_HEADS,
     compile_sparse_mla_qblock,
+    kv_tile_tokens,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 
@@ -261,8 +262,13 @@ def sparse_mla_qblock_fwd_flydsl(
         block_q = suggest_block_q(flat, topk)
     if block_q not in (2, 4):
         raise ValueError(f"Q-block FlyDSL BQ must be 2 or 4, got {block_q}")
-    if packed is None:
-        unique, n_unique, skip_mask = pack_qblock_union(flat, n_tok, topk, block_q, 16)
+    block_k = kv_tile_tokens(block_q)
+    if topk % block_k:
+        skip_mask = False
+    elif packed is None:
+        unique, n_unique, skip_mask = pack_qblock_union(
+            flat, n_tok, topk, block_q, block_k
+        )
     else:
         unique, n_unique, skip_mask = packed
     if not skip_mask:
