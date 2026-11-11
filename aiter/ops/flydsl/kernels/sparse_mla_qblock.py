@@ -7,8 +7,9 @@ One CTA, two modes. BLOCK_Q==1 uses two waves that split D. BLOCK_Q==2/4 uses
 one wave per query for QK and softmax over a shared KV tile, then each wave
 computes a D/BLOCK_Q slice of the output for every query. Both modes:
 
-* gather the next 16 KV rows with coalesced dwordx4 loads while the current
-  tile's MFMA chain runs
+* gather the next KV tile while the current tile's MFMA chain runs: coalesced
+  dwordx4 loads staged in VGPRs, or (one-query on gfx950) a DMA straight from
+  global into the other of two LDS buffers (ping-pong)
 * compute S^T (token on M, head on N): each lane owns one head, the softmax
   reduces across lanes 16 and 32 apart, and P^T is already the PV B operand
 * compute out^T = V^T P^T; a lane owns four adjacent d, so one 8-byte V read
@@ -164,12 +165,16 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
     QK_K = 32 if CDNA4 else 16
     QK_K_LANE = QK_K // 4
     IDX_AHEAD = 0 if ONE_Q else IDX_AHEAD_QBLOCK
+    # One-query on gfx950 DMAs the KV tile into ping-pong LDS buffers. Q-block keeps
+    # VGPR staging into one buffer: the DMA measured no gain there (gfx950).
+    DMA = ONE_Q and CDNA4
+    N_BUF = 2 if DMA else 1
     module_name = (
         f"sparse_mla_mfma_bq{BLOCK_Q}_sink{int(HAS_SINK)}_d{HEAD_DIM}_h{NUM_HEADS}"
         f"{'_prefill' if PREFILL else ''}"
     )
 
-    # One-query fits 16 KB (4 CTAs/CU on gfx942): unpadded rows with the 16-B
+    # One-query fits 16 KB per buffer (4 CTAs/CU on gfx942): unpadded rows with the 16-B
     # column XORed by row & 7. Q-block keeps the padded row plus the exchange.
     SWZ = ONE_Q
     LD = HEAD_DIM if SWZ else LD_KV
@@ -286,15 +291,16 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
 
         # LDS: the KV tile, and (Q-block) one P^T/alpha slot per thread: P^T (4 bf16) + alpha (f32)
         kv_tile_l = fx.make_layout((BLOCK_K, CHUNKS, VEC), (LD, VEC, 1))
+        kv_bufs_l = fx.make_layout((N_BUF, BLOCK_K, CHUNKS, VEC), (_py(fx.cosize(kv_tile_l)), LD, VEC, 1))
         xch_l = _rowmajor(NWARP, WAVE, VEC)
         if const_expr(ONE_Q):
             @fx.struct
             class SharedStorage:
-                kv: fx.Array[fx.BFloat16, _py(fx.cosize(kv_tile_l)), 16]
+                kv: fx.Array[fx.BFloat16, _py(fx.cosize(kv_bufs_l)), 16]
         else:
             @fx.struct
             class SharedStorage:
-                kv: fx.Array[fx.BFloat16, _py(fx.cosize(kv_tile_l)), 16]
+                kv: fx.Array[fx.BFloat16, _py(fx.cosize(kv_bufs_l)), 16]
                 xch: fx.Array[fx.BFloat16, _py(fx.cosize(xch_l)), 16]
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
         # LDS KV tile [row, 16-B chunk, 8]. The operand reads split D into 64-element column
@@ -311,7 +317,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         vt_tok = fx.flat_divide(rows, (4,))  # token (e, k-group) -> row offset
         vt_rows = _swz(fx.make_layout((fx.get_shape(vt_tok), 16, 4), (fx.get_stride(vt_tok), 4, 1)))
         # one-query QK partials [(lane % 32, lane // 32), wave, 8], over the V^T rows already read
-        part = storage.kv.view(fx.make_ordered_layout(((32, 2), NWARP, VEC), ((1, 3), 2, 0)))
+        part_l = fx.make_ordered_layout(((32, 2), NWARP, VEC), ((1, 3), 2, 0))
         # wave w's peer, 1 - w (one-query: two waves)
         peer_of = fx.make_composed_layout(fx.make_layout(2, 1), 1, fx.make_layout(2, -1))
         # Q-block: (m, l) per lane after the loop [wave, lane, 4], and the P^T/alpha exchange [wave, lane, 8]
@@ -330,6 +336,8 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         pv_w = warp
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
         mma_qk = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, QK_K, fx.BFloat16))
+        if const_expr(DMA):
+            dma_atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
 
         # QK pair p over one 16-B load per lane: lane (g, s) owns dims 32p + 8g .. +7,
         # one half per MFMA (K=16: low half for tile 2p, high half for 2p+1).
@@ -348,12 +356,32 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
             fx.copy(atom, idx_lane, r)
             return fx.Int32(fx.Vector(r.load())[0])
 
-        def _gather(idx_vec):
+        def _kv_buf(kt):
+            # LDS KV tile of k-tile kt: buffer kt % N_BUF
+            if const_expr(N_BUF == 1):
+                return storage.kv.ptr
+            b = fx.get_(fx.idx2crd(kt, _colmajor(N_BUF, BIG)), 0).unpack()
+            return storage.kv.ptr + fx.crd2idx((b, 0, 0, 0), kv_bufs_l)
+
+        def _dma_chunk(row):
+            # A DMA lane c lands at physical 16-B chunk c of the row. The swizzle is an
+            # involution, so the lane reads the logical chunk that maps there.
+            if const_expr(SWZ):
+                phys = fx.crd2idx((row, lane, 0), _swz(kv_tile_l))
+                return fx.get_(fx.idx2crd(phys, _colmajor(VEC, CHUNKS, BIG)), 1).unpack()
+            return lane
+
+        def _gather(idx_vec, kv):
+            # DMA: into LDS tile kv, nothing returned. Else: the rows, staged in VGPRs.
             frags = []
             for it in range_constexpr(N_GATHER):
                 lane_sel = fx.get_scalar(fx.crd2idx((it, warp), gather_rows))
                 slot = fx.Int32(fx.rocdl.readlane(T.i32, idx_vec, lane_sel))
-                frags.append(kv_g[slot, lane, None].load())
+                if const_expr(DMA):
+                    dst = fx.make_view(kv + fx.crd2idx((lane_sel, 0, 0), kv_tile_l), fx.make_layout(VEC, 1))
+                    fx.copy_atom_call(dma_atom, kv_g[slot, _dma_chunk(lane_sel), None], dst)
+                else:
+                    frags.append(kv_g[slot, lane, None].load())
             return frags
 
         def _store_kv(frags):
@@ -361,19 +389,19 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
                 # warp_v (VGPR): the lane base absorbs the wave's rows, so row `it` is an immediate.
                 _lds_store(fx.Vector(frags[it]), kv_tile[fx.crd2idx((it, warp_v), gather_rows), lane, None], VEC)
 
-        def _k_a(pr):
+        def _k_a(kv, pr):
             # A operands for pair pr's MFMAs: K[token = lane_row][d of q_frags[pr]].
             sub, blk = _py(fx.get_flat_coord(pr, k_pairs))
-            k_op = (storage.kv.ptr + fx.crd2idx((qk_w, blk, 0), k_cols)).view(k_rows)
+            k_op = (kv + fx.crd2idx((qk_w, blk, 0), k_cols)).view(k_rows)
             return _halves(_lds_load(k_op[lane_row, (sub, lane_g, None)], VEC), halves)
 
-        def _vt_rows(g):
-            vt_op = (storage.kv.ptr + fx.crd2idx((pv_w, g, 0), vt_cols)).view(vt_rows)
+        def _vt_rows(kv, g):
+            vt_op = (kv + fx.crd2idx((pv_w, g, 0), vt_cols)).view(vt_rows)
             return [_lds_load(vt_op[(e, lane_g), lane_row, None], 4) for e in range_constexpr(4)]
 
-        def _vt_group(g, raw=None):
+        def _vt_group(kv, g, raw=None):
             # A operands for tiles (h, g): row r is d = 64g + 4r + h.
-            rows_g = [fx.Vector(r) for r in (raw if raw is not None else _vt_rows(g))]
+            rows_g = [fx.Vector(r) for r in (raw if raw is not None else _vt_rows(kv, g))]
             return [
                 fx.Vector.from_elements([rows_g[e][h] for e in range_constexpr(4)], fx.BFloat16)
                 for h in range_constexpr(H4)
@@ -397,11 +425,12 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         m_i = neg_inf
         l_i = zero_f
         acc = [_zero4() for _ in range_constexpr(N_ACC)]
-        prefetched = _gather(_load_idx(fx.Int32(0)))
+        prefetched = _gather(_load_idx(fx.Int32(0)), _kv_buf(fx.Int32(0)))
+        N_PREF = len(prefetched)
         idx_q = [_load_idx(fx.get_scalar(fx.crd2idx((a, 1), ahead))) for a in range_constexpr(IDX_AHEAD)]
         loop_init = [m_i, l_i] + acc + prefetched + idx_q
         for kt, state in range(fx.Int32(0), n_kt, fx.Int32(1), init=loop_init):
-            (m_i,), (l_i,), acc, prefetched, idx_q = _unpack(state, [1, 1, N_ACC, N_GATHER, IDX_AHEAD])
+            (m_i,), (l_i,), acc, prefetched, idx_q = _unpack(state, [1, 1, N_ACC, N_PREF, IDX_AHEAD])
             m_i = fx.Float32(m_i)
             l_i = fx.Float32(l_i)
             acc = [fx.Vector(a) for a in acc]
@@ -409,9 +438,14 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
             idx_q = [fx.Int32(v) for v in idx_q]
             kt_i32 = fx.Int32(kt)
             kt_next = fx.get_scalar(fx.crd2idx((kt_i32, 1), ahead))
+            kv = _kv_buf(kt_i32)
 
+            # DMA: this tile has landed for every wave, and every wave is done with the
+            # previous tile, so its buffer and the exchange are free. Not wait_asyncmark: it
+            # lacks nocallback, so LLVM splits the register file into 128 VGPRs + 128 AGPRs.
             fx.rocdl.s_waitcnt(vmcnt=0)
-            _store_kv(prefetched)
+            if const_expr(not DMA):
+                _store_kv(prefetched)
             gpu.barrier()
             # Issue the next tile's gather before any LDS read so the bytes
             # stay outstanding across QK, softmax, and PV.
@@ -423,7 +457,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
             if const_expr(IDX_AHEAD > 0):
                 idx_q.append(_load_idx(fx.get_scalar(fx.crd2idx((kt_next, IDX_AHEAD), ahead))))
             if kt_next < n_kt:
-                next_prefetched = _gather(idx_cur)
+                next_prefetched = _gather(idx_cur, _kv_buf(kt_next))
             fx.rocdl.sched_barrier(0)
 
             # One accumulator chain per half, summed after the chain.
@@ -431,7 +465,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
             fx.rocdl.s_setprio(1)
             for b in range_constexpr(_ext(qk_batches, 1)):
                 pairs = [_py(fx.crd2idx((p, b), qk_batches)) for p in range_constexpr(_ext(qk_batches, 0))]
-                buf = [_k_a(pr) for pr in pairs]
+                buf = [_k_a(kv, pr) for pr in pairs]
                 fx.rocdl.sched_barrier(0)
                 for pr, k in zip(pairs, buf):
                     for h in range_constexpr(HALVES):
@@ -446,8 +480,9 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
             if const_expr(ONE_Q):
                 # Read this wave's whole V^T slice first: the partial below overwrites
                 # rows 0-1 of the same D half (LDS ops retire in order per wave).
-                v_raw = [_vt_rows(g) for g in range_constexpr(PV_GROUPS)]
+                v_raw = [_vt_rows(kv, g) for g in range_constexpr(PV_GROUPS)]
 
+                part = kv.view(part_l)
                 part[lane, warp, None].store(fx.Vector(s_acc).bitcast(fx.BFloat16))
                 gpu.barrier()
                 peer_w = fx.get_scalar(fx.crd2idx(warp, peer_of))
@@ -491,7 +526,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
                 fx.rocdl.s_setprio(1)
                 for b in range_constexpr(_ext(pv_batches, 1)):
                     groups = [_py(fx.crd2idx((gg, b), pv_batches)) for gg in range_constexpr(_ext(pv_batches, 0))]
-                    va = [_vt_group(g, v_raw[g]) for g in groups]
+                    va = [_vt_group(kv, g, v_raw[g]) for g in groups]
                     fx.rocdl.sched_barrier(0)
                     for g, vg in zip(groups, va):
                         for h in range_constexpr(H4):
@@ -519,14 +554,15 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
                         acc = _with_query_accs(acc, j, _rescale_all(_query_accs(acc, j), alpha_j))
                 fx.rocdl.s_setprio(1)
                 for g in range_constexpr(PV_GROUPS):
-                    va = _vt_group(g)
+                    va = _vt_group(kv, g)
                     fx.rocdl.sched_barrier(0)
                     for j in range_constexpr(BLOCK_Q):
                         for h in range_constexpr(H4):
                             t = _py(fx.crd2idx((h, g, j), acc_l))
                             acc[t] = _mfma_ssa(mma, va[h], p_bs[j], acc[t])
                 fx.rocdl.s_setprio(0)
-            gpu.barrier()
+            if const_expr(not DMA):
+                gpu.barrier()
             prefetched = next_prefetched
             results = yield [m_i, l_i] + acc + prefetched + idx_q
 
