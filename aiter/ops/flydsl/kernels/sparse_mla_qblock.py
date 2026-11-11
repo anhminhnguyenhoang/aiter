@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 FlyDSL absorbed sparse MLA.
+"""gfx942/gfx950 FlyDSL absorbed sparse MLA.
 
 One CTA, two modes. BLOCK_Q==1 uses two waves that split D. BLOCK_Q==2/4 uses
 one wave per query for QK and softmax over a shared KV tile, then each wave

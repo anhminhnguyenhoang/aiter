@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 FlyDSL absorbed sparse MLA host wrappers. bf16, H=16, D=512."""
+"""gfx942/gfx950 FlyDSL absorbed sparse MLA host wrappers. bf16, H=16, D=512."""
 
 from __future__ import annotations
 
@@ -28,11 +28,14 @@ __all__ = [
 ]
 
 
-def _require_gfx942():
+SUPPORTED_GFX = ("gfx942", "gfx950")
+
+
+def _require_supported_arch():
     gfx = get_gfx_runtime()
-    if gfx != "gfx942":
+    if gfx not in SUPPORTED_GFX:
         raise RuntimeError(
-            f"FlyDSL sparse_mla_qblock is gfx942-only (64 KiB LDS), got {gfx}"
+            f"FlyDSL sparse_mla_qblock supports {', '.join(SUPPORTED_GFX)}, got {gfx}"
         )
 
 
@@ -211,7 +214,7 @@ def sparse_mla_one_query_fwd_flydsl(
     verify_csr: bool = True,
 ):
     """One CTA per query. `uniform_topk` must describe a packed CSR."""
-    _require_gfx942()
+    _require_supported_arch()
     n_tok, _n_kv = _require_contract(q, kv, out)
     flat, topk = _uniform_topk(
         kv_indices, n_tok, kv_indptr, uniform_topk, verify_csr=verify_csr
@@ -247,7 +250,7 @@ def sparse_mla_qblock_fwd_flydsl(
     verify_csr: bool = True,
 ):
     """Exact shared-list reuse. Partial overlap falls back to one-query."""
-    _require_gfx942()
+    _require_supported_arch()
     n_tok, _n_kv = _require_contract(q, kv, out)
     flat, topk = _uniform_topk(
         kv_indices, n_tok, kv_indptr, uniform_topk, verify_csr=verify_csr

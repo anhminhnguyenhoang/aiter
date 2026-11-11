@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 FlyDSL sparse MLA perf on the GLM-5.3-Flash contract.
+"""gfx942/gfx950 FlyDSL sparse MLA perf on the GLM-5.3-Flash contract.
 
 Torch is the reference and is not timed. T=7 is the BQ pad tail. T=16384 is
 the prefill row. shared is exact Q-block reuse; random stays on one-query.
@@ -27,7 +27,7 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx942"]
+SUPPORTED_GFX = ["gfx942", "gfx950"]
 H_FLASH, D_FLASH, TOPK_FLASH, POOL_FLASH = 16, 512, 2048, 131072
 _REF_CHUNK = 128
 
@@ -105,7 +105,7 @@ def main():
         aiter.logger.warning("sparse_mla_qblock unsupported on %s; skipping", get_gfx())
         return
 
-    parser = argparse.ArgumentParser(description="gfx942 FlyDSL sparse MLA perf")
+    parser = argparse.ArgumentParser(description="FlyDSL sparse MLA perf")
     parser.add_argument(
         "-d",
         "--dtype",
