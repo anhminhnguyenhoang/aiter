@@ -18,6 +18,9 @@ computes a D/BLOCK_Q slice of the output for every query. Both modes:
 
     C[i] = (A @ B^T)[lane_k + i, lane_row]
     lane_row = lane % 16, lane_k = (lane // 16) * 4
+
+On gfx950 (CDNA4) QK uses ``v_mfma_f32_16x16x32_bf16``: lane holds
+A[lane % 16][(lane // 16) * 8 + e] for e < 8, same for B; the C map is the one above.
 """
 
 from functools import lru_cache
@@ -28,6 +31,7 @@ from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -41,7 +45,7 @@ VEC = 8
 NEG_INF = float("-inf")
 # Padded KV row pitch (elements), used only by Q-block.
 LD_KV = 528
-# MFMA batches between LDS-read issue and sched_barrier: QK pairs (2 MFMAs each)
+# MFMA batches between LDS-read issue and sched_barrier: QK pairs (2 K=16 or one K=32 MFMA each)
 # and, one-query only, PV groups (4 MFMAs each).
 QK_BATCH_PAIRS_ONE_Q = 4
 QK_BATCH_PAIRS_QBLOCK = 2
@@ -127,7 +131,7 @@ def _unpack(state, counts):
 
 
 def _halves(v8, halves):
-    # 8 bf16 -> MFMA operands for tiles 2p (low half) and 2p+1 (high half); halves: (e, half) -> element
+    # 8 bf16 -> QK MFMA operands; halves: (e, half) -> element. K=16: tiles 2p (low half) and 2p+1 (high half).
     v8 = fx.Vector(v8)
     return [
         fx.Vector.from_elements([v8[_py(fx.crd2idx((e, h), halves))] for e in range_constexpr(_ext(halves, 0))], fx.BFloat16)
@@ -139,6 +143,7 @@ def _halves(v8, halves):
 def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
     if block_q not in (1, 2, 4):
         raise ValueError("BLOCK_Q must be 1, 2, or 4")
+    CDNA4 = get_gfx_runtime() == "gfx950"
 
     BLOCK_Q = int(block_q)
     HAS_SINK = bool(has_sink)
@@ -156,6 +161,8 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
     NQK = NWARP if ONE_Q else 1
     NPV = NWARP
     QK_BATCH = QK_BATCH_PAIRS_ONE_Q if ONE_Q else QK_BATCH_PAIRS_QBLOCK
+    QK_K = 32 if CDNA4 else 16
+    QK_K_LANE = QK_K // 4
     IDX_AHEAD = 0 if ONE_Q else IDX_AHEAD_QBLOCK
     module_name = (
         f"sparse_mla_mfma_bq{BLOCK_Q}_sink{int(HAS_SINK)}_d{HEAD_DIM}_h{NUM_HEADS}"
@@ -205,20 +212,20 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         QK_D_TILES = _py(fx.shape_div(n_d_tiles, NQK))
         PV_D_TILES = _py(fx.shape_div(n_d_tiles, NPV))
         CHUNKS = _ext(fx.zipped_divide(fx.make_layout(HEAD_DIM, 1), (VEC,)), 1)
-        # QK takes the tiles in pairs (one 16-B load feeds tiles 2p, 2p+1),
+        # QK takes the tiles in pairs (one 16-B load feeds tiles 2p, 2p+1: two K=16 or one K=32 MFMA),
         # PV in groups of 4 (one V^T row read feeds tiles 4g .. 4g+3).
         qk_tiles = fx.zipped_divide(fx.make_layout(QK_D_TILES, 1), (2,))  # (half, pair)
         pv_tiles = fx.zipped_divide(fx.make_layout(PV_D_TILES, 1), (4,))  # (h, group)
         QK_PAIRS = _ext(qk_tiles, 1)
         PV_GROUPS = _ext(pv_tiles, 1)
-        HALVES = _ext(qk_tiles, 0)
         H4 = _ext(pv_tiles, 0)
         qk_batches = fx.zipped_divide(fx.make_layout(QK_PAIRS, 1), (QK_BATCH,))  # (pair in batch, batch)
         # a pair's K: (pair % 2 inside the swizzled row, 64-element column block outside it)
         k_pairs = fx.zipped_divide(fx.make_layout(QK_PAIRS, 1), (2,))
         if const_expr(ONE_Q):
             pv_batches = fx.zipped_divide(fx.make_layout(PV_GROUPS, 1), (PV_BATCH_GROUPS_ONE_Q,))
-        halves = fx.zipped_divide(fx.make_layout(VEC, 1), (H4,))  # 8 bf16 -> (e, half)
+        halves = fx.zipped_divide(fx.make_layout(VEC, 1), (QK_K_LANE,))  # 8 bf16 -> (e, half)
+        HALVES = _ext(halves, 1)
         # accumulators: (h, group, query) -> flat list position
         acc_l = _colmajor(H4, PV_GROUPS, 1 if ONE_Q else BLOCK_Q)
         N_ACC = _py(fx.size(acc_l))
@@ -322,9 +329,10 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         idx_row = q_row if const_expr(ONE_Q) else tile
         pv_w = warp
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+        mma_qk = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, QK_K, fx.BFloat16))
 
-        # QK pairs MFMAs 2p, 2p+1 over one 16-B load per lane: lane (g, s)
-        # owns dims 32p + 8g .. +7, low half for 2p and high half for 2p+1.
+        # QK pair p over one 16-B load per lane: lane (g, s) owns dims 32p + 8g .. +7,
+        # one half per MFMA (K=16: low half for tile 2p, high half for 2p+1).
         q_frags = [
             _halves(q_g[q_row, lane_row, qk_w, pr, lane_g, None].load(), halves)
             for pr in range_constexpr(QK_PAIRS)
@@ -354,7 +362,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
                 _lds_store(fx.Vector(frags[it]), kv_tile[fx.crd2idx((it, warp_v), gather_rows), lane, None], VEC)
 
         def _k_a(pr):
-            # A operands for MFMAs 2pr, 2pr+1: K[token = lane_row][d of q_frags[pr]].
+            # A operands for pair pr's MFMAs: K[token = lane_row][d of q_frags[pr]].
             sub, blk = _py(fx.get_flat_coord(pr, k_pairs))
             k_op = (storage.kv.ptr + fx.crd2idx((qk_w, blk, 0), k_cols)).view(k_rows)
             return _halves(_lds_load(k_op[lane_row, (sub, lane_g, None)], VEC), halves)
@@ -418,7 +426,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
                 next_prefetched = _gather(idx_cur)
             fx.rocdl.sched_barrier(0)
 
-            # One accumulator chain per half (tiles 2p and 2p+1), summed after the chain.
+            # One accumulator chain per half, summed after the chain.
             s_accs = [_zero4() for _ in range_constexpr(HALVES)]
             fx.rocdl.s_setprio(1)
             for b in range_constexpr(_ext(qk_batches, 1)):
@@ -427,7 +435,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
                 fx.rocdl.sched_barrier(0)
                 for pr, k in zip(pairs, buf):
                     for h in range_constexpr(HALVES):
-                        s_accs[h] = _mfma_ssa(mma, k[h], q_frags[pr][h], s_accs[h])
+                        s_accs[h] = _mfma_ssa(mma_qk, k[h], q_frags[pr][h], s_accs[h])
             s_acc = s_accs[0]
             for a in s_accs[1:]:
                 s_acc = fx.Vector.from_elements(
