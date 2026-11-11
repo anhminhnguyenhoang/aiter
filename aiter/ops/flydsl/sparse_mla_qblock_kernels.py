@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 FlyDSL absorbed sparse MLA host wrappers. bf16, H=16, D=512."""
+"""gfx942/gfx950 FlyDSL absorbed sparse MLA host wrappers. bf16, H=16, D=512."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from aiter.ops.flydsl.kernels.sparse_mla_qblock import (
     HEAD_DIM,
     NUM_HEADS,
     compile_sparse_mla_qblock,
+    kv_tile_tokens,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 
@@ -28,11 +29,14 @@ __all__ = [
 ]
 
 
-def _require_gfx942():
+SUPPORTED_GFX = ("gfx942", "gfx950")
+
+
+def _require_supported_arch():
     gfx = get_gfx_runtime()
-    if gfx != "gfx942":
+    if gfx not in SUPPORTED_GFX:
         raise RuntimeError(
-            f"FlyDSL sparse_mla_qblock is gfx942-only (64 KiB LDS), got {gfx}"
+            f"FlyDSL sparse_mla_qblock supports {', '.join(SUPPORTED_GFX)}, got {gfx}"
         )
 
 
@@ -211,7 +215,7 @@ def sparse_mla_one_query_fwd_flydsl(
     verify_csr: bool = True,
 ):
     """One CTA per query. `uniform_topk` must describe a packed CSR."""
-    _require_gfx942()
+    _require_supported_arch()
     n_tok, _n_kv = _require_contract(q, kv, out)
     flat, topk = _uniform_topk(
         kv_indices, n_tok, kv_indptr, uniform_topk, verify_csr=verify_csr
@@ -247,7 +251,7 @@ def sparse_mla_qblock_fwd_flydsl(
     verify_csr: bool = True,
 ):
     """Exact shared-list reuse. Partial overlap falls back to one-query."""
-    _require_gfx942()
+    _require_supported_arch()
     n_tok, _n_kv = _require_contract(q, kv, out)
     flat, topk = _uniform_topk(
         kv_indices, n_tok, kv_indptr, uniform_topk, verify_csr=verify_csr
@@ -258,8 +262,13 @@ def sparse_mla_qblock_fwd_flydsl(
         block_q = suggest_block_q(flat, topk)
     if block_q not in (2, 4):
         raise ValueError(f"Q-block FlyDSL BQ must be 2 or 4, got {block_q}")
-    if packed is None:
-        unique, n_unique, skip_mask = pack_qblock_union(flat, n_tok, topk, block_q, 16)
+    block_k = kv_tile_tokens(block_q)
+    if topk % block_k:
+        skip_mask = False
+    elif packed is None:
+        unique, n_unique, skip_mask = pack_qblock_union(
+            flat, n_tok, topk, block_q, block_k
+        )
     else:
         unique, n_unique, skip_mask = packed
     if not skip_mask:

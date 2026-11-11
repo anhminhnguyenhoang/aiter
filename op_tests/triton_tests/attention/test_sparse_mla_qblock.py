@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 FlyDSL sparse MLA correctness for the GLM-5.3-Flash contract."""
+"""gfx942/gfx950 FlyDSL sparse MLA correctness for the GLM-5.3-Flash contract."""
 
 from __future__ import annotations
 
@@ -21,8 +21,12 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import assertAllclose
 
 pytestmark = pytest.mark.skipif(
+    arch_info.get_arch() not in ("gfx942", "gfx950"),
+    reason="FlyDSL sparse MLA supports gfx942 and gfx950",
+)
+gfx942_dispatch = pytest.mark.skipif(
     arch_info.get_arch() != "gfx942",
-    reason="FlyDSL sparse MLA is gfx942-only (64 KiB LDS)",
+    reason="pa_decode_sparse dispatches to FlyDSL on gfx942 only",
 )
 
 H, D = 16, 512
@@ -112,6 +116,7 @@ def test_flydsl_attn_sink(kernel):
     _check_accuracy(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-3, atol=2e-3)
 
 
+@gfx942_dispatch
 @pytest.mark.parametrize("pattern,qblock_reuse", [("shared", False), ("shared", True)])
 def test_pa_decode_sparse_dispatch(pattern, qblock_reuse, monkeypatch):
     torch.manual_seed(2)
@@ -156,6 +161,7 @@ def test_pa_decode_sparse_dispatch(pattern, qblock_reuse, monkeypatch):
     _check_accuracy(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-3, atol=2e-3)
 
 
+@gfx942_dispatch
 def test_pa_decode_sparse_default_splits_skips_flydsl(monkeypatch):
     """Default kv_splits=None must keep Triton's auto split-K, not FlyDSL."""
     torch.manual_seed(6)
@@ -194,6 +200,7 @@ def test_qblock_probe_requires_every_row():
     assert not _qblock_reuse_wins(rows.reshape(-1), 4, topk)
 
 
+@gfx942_dispatch
 def test_unpacked_csr_falls_back():
     torch.manual_seed(4)
     n_tok, topk, pool = 2, 16, 64
@@ -236,6 +243,7 @@ def test_unpacked_csr_falls_back():
     )
 
 
+@gfx942_dispatch
 def test_noncontiguous_q_falls_back():
     torch.manual_seed(5)
     n_tok, topk, pool = 4, 16, 64
@@ -260,6 +268,7 @@ def test_noncontiguous_q_falls_back():
     _check_accuracy(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=1e-2, atol=1e-2)
 
 
+@gfx942_dispatch
 @pytest.mark.parametrize(
     "argument", ["inv_rope_positions", "inv_rope_cos_sin_cache", "out_mxfp8"]
 )
@@ -300,6 +309,7 @@ def test_flydsl_rejects_invalid_scale(scale, wrapper):
         )
 
 
+@gfx942_dispatch
 @pytest.mark.parametrize("scale", [0.0, -1.0])
 def test_pa_decode_sparse_nonpositive_scale(scale, monkeypatch):
     import aiter.ops.flydsl.sparse_mla_qblock_kernels as fly
@@ -336,19 +346,19 @@ def test_flydsl_runtime_arch_helper(monkeypatch):
     import aiter.ops.flydsl.sparse_mla_qblock_kernels as fly
     from aiter.jit.utils import chip_info
 
-    monkeypatch.setenv("GPU_ARCHS", "gfx950")
+    monkeypatch.setenv("GPU_ARCHS", "gfx1250")
     chip_info.get_gfx_custom_op_core.cache_clear()
     chip_info.get_gfx.cache_clear()
     try:
-        assert chip_info.get_gfx() == "gfx950"
-        assert fly.get_gfx_runtime() == "gfx942"
-        fly._require_gfx942()
+        assert chip_info.get_gfx() == "gfx1250"
+        assert fly.get_gfx_runtime() == arch_info.get_arch()
+        fly._require_supported_arch()
     finally:
         chip_info.get_gfx_custom_op_core.cache_clear()
         chip_info.get_gfx.cache_clear()
-    monkeypatch.setattr(fly, "get_gfx_runtime", lambda: "gfx950")
-    with pytest.raises(RuntimeError, match="gfx942-only"):
-        fly._require_gfx942()
+    monkeypatch.setattr(fly, "get_gfx_runtime", lambda: "gfx1250")
+    with pytest.raises(RuntimeError, match="supports gfx942, gfx950"):
+        fly._require_supported_arch()
 
 
 def test_index_span_metadata():
